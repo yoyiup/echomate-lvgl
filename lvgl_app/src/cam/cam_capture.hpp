@@ -40,6 +40,7 @@
 #include <unistd.h>     /* ::close —— UniqueFd 的析构要用 */
 
 #include "cam_image.h"      /* nv12_to_rgb565 / nv12_to_bgr24 / avi_writer（纯 C） */
+#include "h265_recorder.hpp"
 
 /*
  * 预览尺寸 ← 统一在这里定义，cam.h 的宏必须和它一致。
@@ -210,6 +211,7 @@ public:
 	std::string last_photo() const;
 
 	int record_start(const std::string &path, int fps);
+	int record_start_h265(const std::string &path);
 	int record_stop();
 	bool recording() const { return rec_on_.load(); }
 	int record_seconds() const { return rec_sec_.load(); }
@@ -277,7 +279,11 @@ private:
 
 	/* 录像 */
 	std::atomic<bool> rec_on_{ false };
+	enum class RecordMode { Avi, H265Mp4 };
+	RecordMode rec_mode_ = RecordMode::Avi;
+	mutable std::mutex rec_mutex_;
 	avi_writer rec_w_{};
+	H265Recorder h265_;
 	int rec_fps_ = 0;
 	uint64_t rec_started_ms_ = 0;
 	uint64_t rec_next_frame_ms_ = 0;

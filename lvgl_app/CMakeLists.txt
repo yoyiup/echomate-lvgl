@@ -111,6 +111,7 @@ add_executable(lvgl_app
     # ui_camera.c      预览页 + 拍照/录像按钮（C，调 extern "C" 那层）
     src/cam/cam_capture.cpp
     src/cam/cam_image.cpp
+    src/cam/h265_recorder.cpp
     src/ui/ui_camera.c
     # ===== 电机（D1：/dev/echo_motor，两路 GPIO H 桥）=====
     # motor_ctl.cpp  用户态唯一入口：open/ioctl 封装 + RAII + 中文错误
@@ -140,6 +141,12 @@ add_executable(lvgl_app
 set_source_files_properties(src/yolo/yolo_detect.cpp PROPERTIES
     INCLUDE_DIRECTORIES
     "/home/tao/Echo-Mate/Demo/yolov5_demo/cpp/3rdparty/rknpu2/include")
+
+# Rockit/VENC 头文件只给硬件编码封装使用，避免改一个 include 路径就让
+# 整个应用的 C/C++ 文件全部重编。
+set_source_files_properties(src/cam/h265_recorder.cpp PROPERTIES
+    INCLUDE_DIRECTORIES
+    "/home/tao/Echo-Mate/SDK/rv1106-sdk/media/out/include")
 
 # 字模文件全是静态常量数组，优化不了什么，用 -O0 编能让编译时间
 # 从分钟级降到十几秒，产物大小几乎不变（常量数据不会被优化掉）。

@@ -60,7 +60,8 @@
 static lv_obj_t	*page_camera;
 static lv_obj_t	*canvas;
 static lv_obj_t	*btn_photo_lb;		/* 拍照按钮上的字（要能改，做反馈）*/
-static lv_obj_t	*btn_rec_lb;		/* 录像按钮上的字 */
+static lv_obj_t	*btn_rec_lb;		/* AVI 录像按钮上的字 */
+static lv_obj_t	*btn_h265_lb;		/* H.265/MP4 录像按钮上的字 */
 static lv_obj_t	*status_lb;
 static lv_obj_t	*stats_lb;		/* 预览帧率 / 整机 CPU 占用 */
 static lv_obj_t	*rec_dot;		/* 录像中闪的红点 */
@@ -218,6 +219,20 @@ static void photo_cb(lv_event_t *e)
 	}
 }
 
+static int stop_recording(void)
+{
+	int rc = cam_record_stop();
+
+	lv_label_set_text(btn_rec_lb, "AVI");
+	lv_label_set_text(btn_h265_lb, "H265");
+	lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
+	if (rc == 0)
+		lv_label_set_text(status_lb, "录像已保存到 " CAM_DIR);
+	else
+		lv_label_set_text(status_lb, cam_last_error());
+	return rc;
+}
+
 static void rec_cb(lv_event_t *e)
 {
 	char path[96];
@@ -231,10 +246,7 @@ static void rec_cb(lv_event_t *e)
 	}
 
 	if (cam_recording()) {
-		cam_record_stop();
-		lv_label_set_text(btn_rec_lb, "录像");
-		lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
-		lv_label_set_text(status_lb, "已保存到 " CAM_DIR);
+		stop_recording();
 		return;
 	}
 
@@ -243,6 +255,32 @@ static void rec_cb(lv_event_t *e)
 
 	if (cam_record_start(path, 8) == 0) {
 		lv_label_set_text(btn_rec_lb, "停止");
+		lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
+		lv_label_set_text(status_lb, path);
+	} else {
+		lv_label_set_text(status_lb, cam_last_error());
+	}
+}
+
+static void h265_cb(lv_event_t *e)
+{
+	char path[96];
+	int n;
+
+	(void)e;
+	if (!cam_on) {
+		lv_label_set_text(status_lb, "摄像头未就绪");
+		return;
+	}
+	if (cam_recording()) {
+		stop_recording();
+		return;
+	}
+
+	n = next_index(&video_idx, KEEP_VIDEOS);
+	snprintf(path, sizeof(path), CAM_DIR "/video_%02d_h265.mp4", n);
+	if (cam_record_start_h265(path) == 0) {
+		lv_label_set_text(btn_h265_lb, "停止");
 		lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 		lv_label_set_text(status_lb, path);
 	} else {
@@ -267,6 +305,7 @@ static char last_status[80];
 
 static void poll_cb(lv_timer_t *t)
 {
+	static int h265_autotest_state;
 	uint32_t seq;
 	char buf[80];
 
@@ -335,6 +374,18 @@ static void poll_cb(lv_timer_t *t)
 		return;		/* 这一轮先不画，等下一帧 */
 	}
 
+	/* 板端回归测试开关：真实相机就绪后录 2 秒 H.265/MP4。默认完全
+	 * 不运行；部署验证时由守护进程环境临时打开。 */
+	if (getenv("CAM_H265_AUTOTEST")) {
+		if (h265_autotest_state == 0) {
+			h265_cb(NULL);
+			h265_autotest_state = cam_recording() ? 1 : 2;
+		} else if (h265_autotest_state == 1 && cam_record_seconds() >= 2) {
+			stop_recording();
+			h265_autotest_state = 2;
+		}
+	}
+
 	seq = cam_preview(pv_buf, CAM_PV_W * PV_H * 2);
 	if (seq == 0 || seq == last_seq)
 		return;		/* 没新帧就不重绘，省 SPI 带宽 */
@@ -353,6 +404,10 @@ static void poll_cb(lv_timer_t *t)
 		else
 			lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 	} else {
+		/* 达到 10 秒上限自动停止时，也把两个按钮恢复。 */
+		lv_label_set_text(btn_rec_lb, "AVI");
+		lv_label_set_text(btn_h265_lb, "H265");
+		lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 		snprintf(buf, sizeof(buf), "%s  拍照 %u 张",
 			 cam_status(), (unsigned)cam_photo_count());
 	}
@@ -437,14 +492,23 @@ static lv_obj_t *build_camera(void)
 	lv_obj_center(btn_photo_lb);
 	lv_obj_add_event_cb(b1, photo_cb, LV_EVENT_CLICKED, NULL);
 
-	/* 录像 */
+	/* 原始 AVI（兼容旧格式） */
 	lv_obj_t *b2 = lv_button_create(row);
 	lv_obj_set_size(b2, 64, 34);
 	lv_obj_set_style_bg_color(b2, lv_color_hex(0xC03030), 0);
 	btn_rec_lb = lv_label_create(b2);
-	lv_label_set_text(btn_rec_lb, "录像");
+	lv_label_set_text(btn_rec_lb, "AVI");
 	lv_obj_center(btn_rec_lb);
 	lv_obj_add_event_cb(b2, rec_cb, LV_EVENT_CLICKED, NULL);
+
+	/* H.265 硬编并封装 MP4 */
+	lv_obj_t *b3 = lv_button_create(row);
+	lv_obj_set_size(b3, 64, 34);
+	lv_obj_set_style_bg_color(b3, lv_color_hex(0x8050C0), 0);
+	btn_h265_lb = lv_label_create(b3);
+	lv_label_set_text(btn_h265_lb, "H265");
+	lv_obj_center(btn_h265_lb);
+	lv_obj_add_event_cb(b3, h265_cb, LV_EVENT_CLICKED, NULL);
 
 	/* 录像中的红点（默认隐藏）*/
 	rec_dot = lv_obj_create(row);

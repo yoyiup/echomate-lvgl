@@ -178,7 +178,7 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
 
 | 模块 | 入口 / 设备 | 关键开关与注意 |
 |---|---|---|
-| 相机 | `/dev/video*`、`rkaiq` 3A | 驱动**不开机自启**，靠 `load_camera()`；界面报"打开失败"先 `ls /dev/video*`。实测 3A 是 2A（AE+AWB，定焦无 AF），9 线程；`CAM_AIQ=off` 对照：开亮度 113.6 正常色、关 41.7 发绿 |
+| 相机 | `/dev/video*`、`rkaiq` 3A | 驱动**不开机自启**，靠 `load_camera()`；界面报"打开失败"先 `ls /dev/video*`。页面提供 AVI 与 H265 两种录像：H265 使用 RV1106 VENC 硬编，停止后由 ffmpeg 无重编码封装 MP4；首次使用会运行 `/root/bin/load_h265.sh`。实测 3A 是 2A（AE+AWB，定焦无 AF），9 线程；`CAM_AIQ=off` 对照：开亮度 113.6 正常色、关 41.7 发绿 |
 | YOLO | `rknpu.ko` + `librknnmrt.so` + `yolov5.rknn` | **板上原本没有 NPU 驱动**，SDK 里 `CONFIG_ROCKCHIP_RKNPU=m` 编出 `.ko` 直接 insmod；**没加自启，重启后要手动 insmod**。只能零拷贝，输入 UINT8，量化公式 `q = f32/scale + zp`（`zp=-128, scale=1/255`），搞反一个框都检不出 |
 | 电机 | `/dev/echo_motor`，GPIO 32/33(左)、35/36(右) | ioctl 只有 SET/GET/STOP_ALL，语义是"设方向，写一次一直转"，**离开页面必须停**。命令行 `tools/motor_test` 比点屏可靠 |
 | 音频 | 片内 acodec (`card 0: rvacodec`) | 不用自己写驱动；硬件只支持 **2/4 声道**，`-c 1` 报错，**右声道恒为 0**；功放 `GPIO0_A2 ACTIVE_LOW` 驱动自动管 |
@@ -232,6 +232,9 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
 5. GitHub **连接器只有读权限**（写操作一律 `403 Resource not accessible by integration`），
    同步代码需要 PAT；另注意 GitHub 空仓库连 `git/blobs` 都返回 409，必须先用
    `contents` 接口播种一个初始提交，之后才能用 Git Data API 批量推文件。
+6. H.265 运行组件在板上以 `/root/bin/cam_codec.tar.gz` 压缩保存（约 884KB），首次录像
+   展开到 `/tmp/cam_codec` 并加载 `rga3/mpp_vcodec/rockit`。重新刷 rootfs 后需同步部署该压缩包；
+   原始文件来自 SDK 的 `media/out/lib` 与 `sysdrv/out/kernel_drv_ko`。
 
 ---
 

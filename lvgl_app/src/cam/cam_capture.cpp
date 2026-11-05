@@ -716,20 +716,30 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 		photo_req_.store(false, std::memory_order_release);
 	}
 
-	/* ---- 录像：按 fps 抽帧 ---- */
+	/* ---- 录像：AVI 按设定 fps 抽帧；H.265 把每个采集帧交给硬件编码器 ---- */
 	if (rec_on_.load(std::memory_order_acquire)) {
 		const uint64_t now = monotonic_ms();
-		const uint64_t period = 1000 / static_cast<uint64_t>(rec_fps_);
-
-		if (now >= rec_next_frame_ms_) {
-			std::vector<uint8_t> bgr(static_cast<size_t>(kPvW) * kPvH * 3);
-
-			nv12_to_bgr24(y, uv, cap_w_, cap_h_,
-				      bgr.data(), kPvW, kPvH);
-			avi_add_frame(&rec_w_, bgr.data());
-			rec_next_frame_ms_ += period ? period : 1;
-			if (rec_next_frame_ms_ <= now)
-				rec_next_frame_ms_ = now + (period ? period : 1);
+		{
+			std::lock_guard<std::mutex> lk(rec_mutex_);
+			if (rec_on_.load(std::memory_order_acquire)) {
+				if (rec_mode_ == RecordMode::H265Mp4) {
+					h265_.submit(y, uv, now * 1000);
+				} else {
+					const uint64_t period = 1000 /
+						static_cast<uint64_t>(rec_fps_);
+					if (now >= rec_next_frame_ms_) {
+						std::vector<uint8_t> bgr(
+							static_cast<size_t>(kPvW) * kPvH * 3);
+						nv12_to_bgr24(y, uv, cap_w_, cap_h_,
+							      bgr.data(), kPvW, kPvH);
+						avi_add_frame(&rec_w_, bgr.data());
+						rec_next_frame_ms_ += period ? period : 1;
+						if (rec_next_frame_ms_ <= now)
+							rec_next_frame_ms_ = now +
+								(period ? period : 1);
+					}
+				}
+			}
 		}
 
 		/* 用单调时钟计时，不再依赖任何写死的摄像头帧率。 */
@@ -799,6 +809,8 @@ std::string CamCapture::last_photo() const
 
 int CamCapture::record_start(const std::string &path, int fps)
 {
+	std::lock_guard<std::mutex> lk(rec_mutex_);
+
 	if (!run_.load(std::memory_order_acquire) || rec_on_.load())
 		return -1;
 	if (fps < 1)
@@ -812,6 +824,7 @@ int CamCapture::record_start(const std::string &path, int fps)
 	}
 
 	rec_fps_ = fps;
+	rec_mode_ = RecordMode::Avi;
 	rec_started_ms_ = monotonic_ms();
 	rec_next_frame_ms_ = rec_started_ms_;
 	rec_sec_.store(0);
@@ -821,21 +834,55 @@ int CamCapture::record_start(const std::string &path, int fps)
 	return 0;
 }
 
+int CamCapture::record_start_h265(const std::string &path)
+{
+	std::lock_guard<std::mutex> lk(rec_mutex_);
+
+	if (!run_.load(std::memory_order_acquire) || rec_on_.load())
+		return -1;
+	/* 没拿到驱动报告时，SC3336 的正式模式就是 30fps。这里不是给
+	 * 摄像头限帧，只是写进码流/MP4 的时间基。 */
+	rec_fps_ = capture_fps_ > 0 ? capture_fps_ : 30;
+	if (h265_.start(path, cap_w_, cap_h_, rec_fps_) != 0) {
+		set_error("%s", h265_.last_error().c_str());
+		return -1;
+	}
+
+	rec_mode_ = RecordMode::H265Mp4;
+	rec_started_ms_ = monotonic_ms();
+	rec_next_frame_ms_ = rec_started_ms_;
+	rec_sec_.store(0);
+	rec_on_.store(true, std::memory_order_release);
+	log("开始 H265/MP4 录像：%s  %dx%d@%dfps（上限 %d 秒）",
+	    path.c_str(), cap_w_, cap_h_, rec_fps_, kRecMaxSec);
+	return 0;
+}
+
 int CamCapture::record_stop()
 {
-	if (!rec_on_.load(std::memory_order_acquire))
+	/* 先清标志，阻止下一帧进编码器，再等正在提交的帧退出。 */
+	if (!rec_on_.exchange(false, std::memory_order_acq_rel))
 		return -1;
 
-	rec_on_.store(false, std::memory_order_release);
-	avi_close(&rec_w_);
+	std::lock_guard<std::mutex> lk(rec_mutex_);
+	int frames;
+	int rc = 0;
+	if (rec_mode_ == RecordMode::H265Mp4) {
+		rc = h265_.stop();
+		frames = h265_.frames();
+		if (rc != 0)
+			set_error("%s", h265_.last_error().c_str());
+	} else {
+		avi_close(&rec_w_);
+		frames = static_cast<int>(rec_w_.frames);
+	}
 
-	const int frames = static_cast<int>(rec_w_.frames);
 	const int elapsed = rec_started_ms_ ?
 		static_cast<int>((monotonic_ms() - rec_started_ms_) / 1000) : 0;
 
 	log("录像结束：%d 帧 / %d 秒", frames, rec_sec_.load());
 	rec_sec_.store(elapsed);
-	return 0;
+	return rc;
 }
 
 std::string CamCapture::status() const { return status_; }
@@ -929,6 +976,11 @@ const char *cam_last_photo(void)
 int cam_record_start(const char *path, int fps)
 {
 	return path ? camp::instance().record_start(path, fps) : -1;
+}
+
+int cam_record_start_h265(const char *path)
+{
+	return path ? camp::instance().record_start_h265(path) : -1;
 }
 
 int cam_record_stop(void) { return camp::instance().record_stop(); }

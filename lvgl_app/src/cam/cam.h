@@ -142,6 +142,8 @@ const char *cam_last_photo(void);
  * 超过 CAM_REC_MAX_SEC 秒自动停（防止把 /tmp 写爆）。
  */
 int  cam_record_start(const char *path, int fps);
+/** 第二种录像格式：硬件 H.265 编码，停止时封装为 MP4。 */
+int  cam_record_start_h265(const char *path);
 int  cam_record_stop(void);
 bool cam_recording(void);
 
