@@ -1,0 +1,25 @@
+# 编译产物
+build/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.a
+*.so
+Module.symvers
+modules.order
+.tmp_build/
+
+# 备份 / 临时
+*.bak
+*.bak_*
+*.orig
+*.tmp
+
+# 截图存档（本地产物，不进仓库）
+shots/
+
+# 本地编译出来的 x86 测试程序（源码 .c 已入库）
+lvgl_app/tools/block_test
+lvgl_app/tools/wpa_psk_test
