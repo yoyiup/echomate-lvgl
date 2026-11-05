@@ -74,9 +74,6 @@ extern "C" {
 #define CAM_CAP_W	320
 #define CAM_CAP_H	240
 
-/* 采集帧率。跟 sensor 的 25fps 对齐，不额外降帧，让 3A 收敛得快些 */
-#define CAM_FPS		25
-
 /* ---------------- 生命周期 ---------------- */
 
 /**
@@ -138,7 +135,7 @@ const char *cam_last_photo(void);
 /* ---------------- 录像 ---------------- */
 
 /**
- * 开始录像（AVI，未压缩 BGR24，25fps 输入按 fps 抽帧）。
+ * 开始录像（AVI，未压缩 BGR24，从实际采集帧中按时间抽帧）。
  *   path : 输出文件
  *   fps  : 1~10，实际写入帧率
  *

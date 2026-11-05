@@ -53,7 +53,6 @@ constexpr int kPvH = 160;
 
 constexpr int kCapW = 320;          /* 采集分辨率，见 cam.h 的说明 */
 constexpr int kCapH = 240;
-constexpr int kCamFps = 25;
 constexpr int kNumBuf = 4;
 constexpr int kRecMaxSec = 10;      /* 录像时长上限，防止把 /tmp 写满 */
 
@@ -280,11 +279,13 @@ private:
 	std::atomic<bool> rec_on_{ false };
 	avi_writer rec_w_{};
 	int rec_fps_ = 0;
-	int rec_frame_cnt_ = 0;
+	uint64_t rec_started_ms_ = 0;
+	uint64_t rec_next_frame_ms_ = 0;
 	std::atomic<int> rec_sec_{ 0 };
 
 	int cap_w_ = kCapW;
 	int cap_h_ = kCapH;
+	int capture_fps_ = 0;		/* 驱动确认的实际档位；0 表示由驱动自行决定 */
 
 	mutable std::mutex err_mutex_;
 	std::string err_;

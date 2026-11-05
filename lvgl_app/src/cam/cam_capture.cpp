@@ -114,6 +114,15 @@ void CamCapture::set_error(const char *fmt, ...)
 /* V4L2 多平面：rkisp 的节点是 VIDEO_CAPTURE_MPLANE，用单平面 API 会 EINVAL */
 static constexpr v4l2_buf_type kCapType = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
+static uint64_t monotonic_ms()
+{
+	timespec ts{};
+
+	::clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<uint64_t>(ts.tv_sec) * 1000 +
+	       static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+}
+
 /* ================================================================== */
 /* 生命周期                                                           */
 /* ================================================================== */
@@ -163,8 +172,10 @@ int CamCapture::start(const std::string &video_dev,
 		return -EAGAIN;
 	}
 
-	status_ = std::to_string(cap_w_) + "x" + std::to_string(cap_h_) +
-		  (aiq_ok_ ? " 3A on" : " 3A off");
+	status_ = std::to_string(cap_w_) + "x" + std::to_string(cap_h_);
+	if (capture_fps_ > 0)
+		status_ += "@" + std::to_string(capture_fps_);
+	status_ += aiq_ok_ ? " 3A on" : " 3A off";
 	log("摄像头已启动：%s", status_.c_str());
 	return 0;
 }
@@ -322,12 +333,74 @@ bool CamCapture::open_device(const std::string &dev)
 		return false;
 	}
 
-	/* 帧率对齐 25fps，减少 SPI 屏和 CPU 压力 */
+	/*
+	 * 不写死帧率：枚举当前分辨率/格式支持的档位，选择最短帧间隔，
+	 * 也就是摄像头和 ISP 对外声明的最高帧率。驱动不支持枚举时不下发
+	 * S_PARM，保留它自己的默认（通常就是 sensor 当前模式的最高速率）。
+	 */
+	v4l2_fract fastest{};
+	bool have_fastest = false;
+	for (uint32_t i = 0; ; i++) {
+		v4l2_frmivalenum fi{};
+
+		fi.index = i;
+		fi.pixel_format = fmt.fmt.pix_mp.pixelformat;
+		fi.width = static_cast<uint32_t>(cap_w_);
+		fi.height = static_cast<uint32_t>(cap_h_);
+		if (xioctl(fd_.get(), VIDIOC_ENUM_FRAMEINTERVALS, &fi) < 0)
+			break;
+
+		v4l2_fract candidate{};
+		if (fi.type == V4L2_FRMIVAL_TYPE_DISCRETE)
+			candidate = fi.discrete;
+		else if (fi.type == V4L2_FRMIVAL_TYPE_CONTINUOUS ||
+			 fi.type == V4L2_FRMIVAL_TYPE_STEPWISE)
+			candidate = fi.stepwise.min;
+		else
+			continue;
+
+		if (!candidate.numerator || !candidate.denominator)
+			continue;
+		if (!have_fastest ||
+		    static_cast<uint64_t>(candidate.denominator) * fastest.numerator >
+		    static_cast<uint64_t>(fastest.denominator) * candidate.numerator) {
+			fastest = candidate;
+			have_fastest = true;
+		}
+
+		/* 连续/步进类型用一个范围描述全部档位，只需读 index 0。 */
+		if (fi.type != V4L2_FRMIVAL_TYPE_DISCRETE)
+			break;
+	}
+
+	if (have_fastest) {
+		parm = {};
+		parm.type = kCapType;
+		if (xioctl(fd_.get(), VIDIOC_G_PARM, &parm) == 0) {
+			parm.parm.capture.timeperframe = fastest;
+			if (xioctl(fd_.get(), VIDIOC_S_PARM, &parm) < 0)
+				log("驱动拒绝最高帧率请求，使用默认档位: %s",
+				    std::strerror(errno));
+		}
+	}
+
+	/* 再读一次驱动最终接受的档位，仅用于状态和录像上限。 */
+	parm = {};
 	parm.type = kCapType;
-	if (xioctl(fd_.get(), VIDIOC_G_PARM, &parm) == 0) {
-		parm.parm.capture.timeperframe.numerator = 1;
-		parm.parm.capture.timeperframe.denominator = kCamFps;
-		(void)xioctl(fd_.get(), VIDIOC_S_PARM, &parm);
+	capture_fps_ = 0;
+	if (xioctl(fd_.get(), VIDIOC_G_PARM, &parm) == 0 &&
+	    parm.parm.capture.timeperframe.numerator &&
+	    parm.parm.capture.timeperframe.denominator) {
+		const v4l2_fract &tpf = parm.parm.capture.timeperframe;
+
+		capture_fps_ = static_cast<int>((tpf.denominator +
+					      tpf.numerator / 2) / tpf.numerator);
+		log("摄像头帧率档位：%u/%u = %.2f fps%s",
+		    tpf.denominator, tpf.numerator,
+		    static_cast<double>(tpf.denominator) / tpf.numerator,
+		    have_fastest ? "（已选择最高档）" : "（驱动默认）");
+	} else {
+		log("驱动未报告帧率档位，保持默认并按实际帧计数显示");
 	}
 
 	/* ---- 申请 buffer ---- */
@@ -645,24 +718,24 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 
 	/* ---- 录像：按 fps 抽帧 ---- */
 	if (rec_on_.load(std::memory_order_acquire)) {
-		int every = (kCamFps + rec_fps_ - 1) / (rec_fps_ ? rec_fps_ : 1);
+		const uint64_t now = monotonic_ms();
+		const uint64_t period = 1000 / static_cast<uint64_t>(rec_fps_);
 
-		if (every < 1)
-			every = 1;
-
-		if (rec_frame_cnt_ % every == 0) {
+		if (now >= rec_next_frame_ms_) {
 			std::vector<uint8_t> bgr(static_cast<size_t>(kPvW) * kPvH * 3);
 
 			nv12_to_bgr24(y, uv, cap_w_, cap_h_,
 				      bgr.data(), kPvW, kPvH);
 			avi_add_frame(&rec_w_, bgr.data());
+			rec_next_frame_ms_ += period ? period : 1;
+			if (rec_next_frame_ms_ <= now)
+				rec_next_frame_ms_ = now + (period ? period : 1);
 		}
-		rec_frame_cnt_++;
 
-		/* 时长上限：到点自动停，防止把 /tmp 写满 */
-		if (rec_frame_cnt_ % kCamFps == 0) {
-			int sec = rec_frame_cnt_ / kCamFps;
+		/* 用单调时钟计时，不再依赖任何写死的摄像头帧率。 */
+		const int sec = static_cast<int>((now - rec_started_ms_) / 1000);
 
+		if (sec != rec_sec_.load()) {
 			rec_sec_.store(sec);
 			if (sec >= kRecMaxSec) {
 				log("录像达到 %d 秒上限，自动停止", kRecMaxSec);
@@ -730,8 +803,8 @@ int CamCapture::record_start(const std::string &path, int fps)
 		return -1;
 	if (fps < 1)
 		fps = 8;
-	if (fps > kCamFps)
-		fps = kCamFps;
+	if (capture_fps_ > 0 && fps > capture_fps_)
+		fps = capture_fps_;
 
 	if (avi_open(&rec_w_, path.c_str(), kPvW, kPvH, fps) != 0) {
 		set_error("创建录像文件失败：%s", path.c_str());
@@ -739,7 +812,8 @@ int CamCapture::record_start(const std::string &path, int fps)
 	}
 
 	rec_fps_ = fps;
-	rec_frame_cnt_ = 0;
+	rec_started_ms_ = monotonic_ms();
+	rec_next_frame_ms_ = rec_started_ms_;
 	rec_sec_.store(0);
 	rec_on_.store(true, std::memory_order_release);
 	log("开始录像：%s  %dx%d@%dfps（上限 %d 秒）",
@@ -756,9 +830,11 @@ int CamCapture::record_stop()
 	avi_close(&rec_w_);
 
 	const int frames = static_cast<int>(rec_w_.frames);
+	const int elapsed = rec_started_ms_ ?
+		static_cast<int>((monotonic_ms() - rec_started_ms_) / 1000) : 0;
 
 	log("录像结束：%d 帧 / %d 秒", frames, rec_sec_.load());
-	rec_sec_.store(frames / (rec_fps_ ? rec_fps_ : 8));
+	rec_sec_.store(elapsed);
 	return 0;
 }
 

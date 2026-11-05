@@ -26,7 +26,7 @@
  *
  * 【页面进出时启停摄像头】
  *   进入页面才 cam_start()，离开就 cam_stop()。
- *   理由：640x480@25fps 的 YUV→RGB 转换要吃掉这颗单核 A7 相当一部分算力，
+ *   理由：摄像头满速采集时的 YUV→RGB 转换会吃掉这颗单核 A7 相当一部分算力，
  *   一直开着会让其它页面（尤其语音对话的音频线程）变卡。
  */
 
@@ -62,6 +62,7 @@ static lv_obj_t	*canvas;
 static lv_obj_t	*btn_photo_lb;		/* 拍照按钮上的字（要能改，做反馈）*/
 static lv_obj_t	*btn_rec_lb;		/* 录像按钮上的字 */
 static lv_obj_t	*status_lb;
+static lv_obj_t	*stats_lb;		/* 预览帧率 / 整机 CPU 占用 */
 static lv_obj_t	*rec_dot;		/* 录像中闪的红点 */
 
 static uint16_t	*pv_buf;		/* canvas 的像素缓冲（RGB565）*/
@@ -70,6 +71,10 @@ static int	 shot_idx;		/* 第几张照片，用来生成文件名 */
 static int	 video_idx;
 static lv_timer_t *poll_timer;
 static int	 cam_on;		/* 我们这边记录的"摄像头是否已启动" */
+
+/* /proc/stat 是累计值，CPU 占用率必须用相邻两次采样的差值计算。 */
+static uint64_t	 cpu_last_total;
+static uint64_t	 cpu_last_idle;
 
 /* ------------------------------------------------------------------ */
 /* 小工具                                                             */
@@ -94,6 +99,97 @@ static int next_index(int *idx, int keep)
 
 	*idx = (*idx + 1) % keep;
 	return v;
+}
+
+/* 读取整机 CPU 的累计时间。idle 把 iowait 也算入空闲时间。 */
+static int read_cpu_ticks(uint64_t *total, uint64_t *idle)
+{
+	unsigned long long user, nice, system, idle_tick;
+	unsigned long long iowait, irq, softirq, steal;
+	char line[256];
+	FILE *fp = fopen("/proc/stat", "r");
+
+	if (!fp)
+		return -1;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+		   &user, &nice, &system, &idle_tick, &iowait,
+		   &irq, &softirq, &steal) != 8)
+		return -1;
+
+	*idle = (uint64_t)idle_tick + (uint64_t)iowait;
+	*total = (uint64_t)user + (uint64_t)nice + (uint64_t)system +
+		 (uint64_t)idle_tick + (uint64_t)iowait + (uint64_t)irq +
+		 (uint64_t)softirq + (uint64_t)steal;
+	return 0;
+}
+
+/* 每秒更新一次，避免统计标签本身频繁触发重绘。 */
+static void stats_cb(lv_timer_t *t)
+{
+	static uint32_t prev_seq;
+	static uint32_t prev_ms;
+	uint64_t total, idle;
+	uint32_t seq, now, elapsed, fps10 = 0;
+	int cpu = -1;
+	char text[40];
+
+	(void)t;
+
+	if (lv_screen_active() != page_camera) {
+		prev_seq = 0;
+		prev_ms = 0;
+		cpu_last_total = 0;
+		cpu_last_idle = 0;
+		return;
+	}
+
+	/*
+	 * last_seq 来自采集线程的帧序号。即使 UI 只每 50ms 取一次图，
+	 * 序号仍会按摄像头实际完成的每一帧递增，因此不会被 20Hz 的
+	 * 页面轮询频率封顶。
+	 */
+	now = lv_tick_get();
+	seq = last_seq;
+	if (cam_on && prev_ms && seq >= prev_seq) {
+		elapsed = now - prev_ms;
+		if (elapsed)
+			fps10 = (uint32_t)(((uint64_t)(seq - prev_seq) * 10000 +
+					 elapsed / 2) / elapsed);
+	}
+	prev_seq = seq;
+	prev_ms = now;
+
+	if (read_cpu_ticks(&total, &idle) == 0) {
+		if (cpu_last_total && total > cpu_last_total) {
+			uint64_t total_delta = total - cpu_last_total;
+			uint64_t idle_delta = idle - cpu_last_idle;
+
+			if (idle_delta > total_delta)
+				idle_delta = total_delta;
+			cpu = (int)((100 * (total_delta - idle_delta) +
+				     total_delta / 2) / total_delta);
+		}
+		cpu_last_total = total;
+		cpu_last_idle = idle;
+	}
+
+	if (cpu >= 0)
+		snprintf(text, sizeof(text), "CAM %u.%u FPS  CPU %d%%",
+			 (unsigned)(fps10 / 10), (unsigned)(fps10 % 10), cpu);
+	else
+		snprintf(text, sizeof(text), "CAM %u.%u FPS  CPU --",
+			 (unsigned)(fps10 / 10), (unsigned)(fps10 % 10));
+	lv_label_set_text(stats_lb, text);
+
+	/* 测试时显式打开，正常运行不刷日志。 */
+	if (getenv("CAM_STATS_LOG"))
+		printf("[camera-stats] %s\n", text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -233,6 +329,7 @@ static void poll_cb(lv_timer_t *t)
 		}
 
 		cam_on = 1;
+		last_seq = 0;		/* cam_start 会把采集序号从 0 重新计数 */
 		last_status[0] = 0;	/* 状态变了，强制刷新文字 */
 		lv_label_set_text(status_lb, cam_status());
 		return;		/* 这一轮先不画，等下一帧 */
@@ -307,6 +404,16 @@ static lv_obj_t *build_camera(void)
 	lv_obj_set_style_border_width(canvas, 0, 0);
 	lv_obj_set_style_pad_all(canvas, 0, 0);
 
+	/* 叠在画面右上角，半透明底色保证明暗场景下都看得清。 */
+	stats_lb = lv_label_create(canvas);
+	lv_label_set_text(stats_lb, "CAM 0.0 FPS  CPU --");
+	lv_obj_set_style_text_color(stats_lb, lv_color_white(), 0);
+	lv_obj_set_style_bg_color(stats_lb, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(stats_lb, LV_OPA_60, 0);
+	lv_obj_set_style_pad_hor(stats_lb, 4, 0);
+	lv_obj_set_style_pad_ver(stats_lb, 2, 0);
+	lv_obj_align(stats_lb, LV_ALIGN_TOP_RIGHT, -4, 4);
+
 	/* ---- 按钮行 ---- */
 	row = lv_obj_create(body);
 	lv_obj_set_width(row, lv_pct(100));
@@ -357,6 +464,7 @@ static lv_obj_t *build_camera(void)
 	/* ---- 轮询定时器 ---- */
 	last_seq = 0;
 	poll_timer = lv_timer_create(poll_cb, 50, NULL);
+	lv_timer_create(stats_cb, 1000, NULL);
 
 	return scr;
 }
