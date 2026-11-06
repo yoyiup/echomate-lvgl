@@ -32,7 +32,7 @@ cp "$WIFI/precompile/arm-rockchip830-linux-uclibcgnueabihf/bin/dnsmasq" \
 	"$OUT/echomate-dnsmasq"
 cp "$WIFI/precompile/arm-rockchip830-linux-uclibcgnueabihf/lib/libintl.so.8" \
 	"$OUT/libintl.so.8"
-"$CROSS-g++" -std=c++17 -Os -Wall -Wextra "$HERE/transfer_server.cpp" \
+"$CROSS-g++" -std=c++17 -Os -Wall -Wextra -pthread "$HERE/transfer_server.cpp" \
 	-o "$OUT/echomate-transfer"
 "$CROSS-strip" -s "$OUT/echomate-transfer"
 cp "$HERE/hotspot.sh" "$OUT/echomate-hotspot.sh"

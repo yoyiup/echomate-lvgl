@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -10,6 +11,8 @@
 
 #include <cerrno>
 #include <cctype>
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +22,7 @@ static const size_t kMaxUpload = 8 * 1024 * 1024;
 static const size_t kReserve = 4 * 1024 * 1024;
 static const char *upload_dir;
 static const char *camera_dir;
+static std::atomic<int> active_clients{0};
 
 static bool send_all(int fd, const void *data, size_t len)
 {
@@ -221,9 +225,10 @@ static void upload(int fd, const char *encoded, const std::string &raw, size_t b
 
 static void handle(int fd)
 {
-    struct timeval tv{30, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct timeval header_timeout{3, 0};
+    struct timeval transfer_timeout{30, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &header_timeout, sizeof(header_timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &transfer_timeout, sizeof(transfer_timeout));
     std::string raw;
     char buf[2048];
     size_t end;
@@ -255,10 +260,20 @@ static void handle(int fd)
             p = next + 2;
         }
         if (!found) { reply(fd, 411, "Length Required", "text/plain", "missing length"); return; }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &transfer_timeout, sizeof(transfer_timeout));
         upload(fd, path + 8, raw, end + 4, length);
         return;
     }
     reply(fd, 404, "Not Found", "text/plain", "not found");
+}
+
+static void *serve_client(void *arg)
+{
+    int fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    handle(fd);
+    close(fd);
+    active_clients.fetch_sub(1, std::memory_order_release);
+    return nullptr;
 }
 
 int main(int argc, char **argv)
@@ -286,8 +301,24 @@ int main(int argc, char **argv)
     for (;;) {
         int client = accept(server, nullptr, nullptr);
         if (client < 0) { if (errno == EINTR) continue; break; }
-        handle(client);
-        close(client);
+        if (active_clients.fetch_add(1, std::memory_order_acq_rel) >= 6) {
+            active_clients.fetch_sub(1, std::memory_order_release);
+            reply(client, 503, "Busy", "text/plain", "try again");
+            close(client);
+            continue;
+        }
+        pthread_attr_t attr;
+        pthread_t thread;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 128 * 1024);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&thread, &attr, serve_client,
+                                reinterpret_cast<void *>(static_cast<intptr_t>(client)));
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            active_clients.fetch_sub(1, std::memory_order_release);
+            close(client);
+        }
     }
     return 0;
 }
