@@ -30,6 +30,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <linux/videodev2.h>
@@ -121,6 +122,17 @@ static uint64_t monotonic_ms()
 	::clock_gettime(CLOCK_MONOTONIC, &ts);
 	return static_cast<uint64_t>(ts.tv_sec) * 1000 +
 	       static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+}
+
+/* /tmp 是内存盘，AVI 每帧约 154KB；至少留 4MB 给系统和 AVI 索引。 */
+static bool avi_space_ok(const std::string &path, uint64_t next_bytes)
+{
+	struct statvfs fs{};
+	const std::string dir = path.substr(0, path.find_last_of('/'));
+	if (::statvfs(dir.c_str(), &fs) != 0)
+		return false;
+	return static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize >=
+		4ULL * 1024 * 1024 + next_bytes;
 }
 
 /* ================================================================== */
@@ -719,6 +731,7 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 	/* ---- 录像：AVI 按设定 fps 抽帧；H.265 把每个采集帧交给硬件编码器 ---- */
 	if (rec_on_.load(std::memory_order_acquire)) {
 		const uint64_t now = monotonic_ms();
+		bool no_space = false;
 		{
 			std::lock_guard<std::mutex> lk(rec_mutex_);
 			if (rec_on_.load(std::memory_order_acquire)) {
@@ -728,6 +741,9 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 					const uint64_t period = 1000 /
 						static_cast<uint64_t>(rec_fps_);
 					if (now >= rec_next_frame_ms_) {
+						if (!avi_space_ok("/tmp/cam", rec_w_.frame_bytes + 32)) {
+							no_space = true;
+						} else {
 						std::vector<uint8_t> bgr(
 							static_cast<size_t>(kPvW) * kPvH * 3);
 						nv12_to_bgr24(y, uv, cap_w_, cap_h_,
@@ -737,9 +753,15 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 						if (rec_next_frame_ms_ <= now)
 							rec_next_frame_ms_ = now +
 								(period ? period : 1);
+						}
 					}
 				}
 			}
+		}
+		if (no_space) {
+			set_error("录像已停止：临时空间不足，先备份或清理旧视频");
+			record_stop();
+			return;
 		}
 
 		/* 用单调时钟计时，不再依赖任何写死的摄像头帧率。 */
@@ -817,6 +839,10 @@ int CamCapture::record_start(const std::string &path, int fps)
 		fps = 8;
 	if (capture_fps_ > 0 && fps > capture_fps_)
 		fps = capture_fps_;
+	if (!avi_space_ok(path, static_cast<uint64_t>(kPvW) * kPvH * 3 + 32)) {
+		set_error("临时空间不足，先备份或清理旧视频");
+		return -1;
+	}
 
 	if (avi_open(&rec_w_, path.c_str(), kPvW, kPvH, fps) != 0) {
 		set_error("创建录像文件失败：%s", path.c_str());
