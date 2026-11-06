@@ -24,6 +24,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -54,11 +55,14 @@ static int crop_top(void)
 static lv_obj_t	*page_yolo;
 static lv_obj_t	*canvas;
 static lv_obj_t	*status_lb;
+static lv_obj_t	*cpu_lb;
 static lv_obj_t	*box_obj[MAX_DRAW];
 static lv_obj_t	*box_lb[MAX_DRAW];
 static uint16_t	*pv_buf;
 static lv_timer_t *poll_timer;
 static uint32_t	last_yolo_seq;
+static uint32_t	last_preview_seq;
+static uint64_t	cpu_last_total, cpu_last_idle;
 static int	yolo_started;
 
 /* 12 色调色板：按类别 id 取，保证同一个类永远是同一个颜色 */
@@ -75,6 +79,8 @@ static uint32_t cls_color(int cls)
 /* 进入页面：开相机 + 开 RGB 通路 + 起推理 */
 static void yolo_page_enter(void)
 {
+	last_preview_seq = 0;
+	cpu_last_total = cpu_last_idle = 0;
 	if (!cam_running()) {
 		/* /dev/video11 = rkisp mainpath，和摄像头页用的是同一个节点 */
 		if (cam_start("/dev/video11", "/userdata/cam/iqfiles") != 0) {
@@ -217,11 +223,14 @@ static void draw_boxes(const yolo_result *r)
 static void poll_cb(lv_timer_t *t)
 {
 	(void)t;
+	if (lv_screen_active() != page_yolo)
+		return;
 
 	/* ---- 1. 预览 ---- */
 	uint32_t s = cam_preview(pv_buf, PV_W * PV_H * 2);
 
-	if (s) {
+	if (s && s != last_preview_seq) {
+		last_preview_seq = s;
 		lv_obj_invalidate(canvas);
 	} else if (!cam_running()) {
 		/* 相机没跑起来时把错误写在状态条上，别让人对着黑屏猜 */
@@ -241,6 +250,44 @@ static void poll_cb(lv_timer_t *t)
 
 	if (st && st[0] && strcmp(lv_label_get_text(status_lb), st) != 0)
 		lv_label_set_text(status_lb, st);
+}
+
+/* /proc/stat 的相邻两次累计值之差，显示整机 CPU 占用。 */
+static void cpu_cb(lv_timer_t *t)
+{
+	unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+	uint64_t total, idle_total;
+	char line[256];
+	FILE *fp;
+	(void)t;
+	if (lv_screen_active() != page_yolo) {
+		cpu_last_total = cpu_last_idle = 0;
+		return;
+	}
+	fp = fopen("/proc/stat", "r");
+	if (!fp)
+		return;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return;
+	}
+	fclose(fp);
+	if (sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+		   &user, &nice, &system, &idle, &iowait,
+		   &irq, &softirq, &steal) != 8)
+		return;
+	total = user + nice + system + idle + iowait + irq + softirq + steal;
+	idle_total = idle + iowait;
+	if (cpu_last_total && total > cpu_last_total) {
+		uint64_t dt = total - cpu_last_total;
+		uint64_t di = idle_total - cpu_last_idle;
+		int cpu = (int)((100 * (dt - (di > dt ? dt : di)) + dt / 2) / dt);
+		lv_label_set_text_fmt(cpu_lb, "CPU %d%%", cpu);
+		if (getenv("YOLO_STATS_LOG"))
+			printf("[yolo-stats] CPU %d%% %s\n", cpu, yolo_status());
+	}
+	cpu_last_total = total;
+	cpu_last_idle = idle_total;
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,6 +315,14 @@ static lv_obj_t *build_yolo(void)
 	lv_obj_set_size(canvas, PV_W, PV_H);
 	lv_obj_set_style_border_width(canvas, 0, 0);
 	lv_obj_set_style_pad_all(canvas, 0, 0);
+	cpu_lb = lv_label_create(canvas);
+	lv_label_set_text(cpu_lb, "CPU --");
+	lv_obj_set_style_text_font(cpu_lb, &lv_font_montserrat_14, 0);
+	lv_obj_set_style_text_color(cpu_lb, lv_color_hex(0xFFFFFF), 0);
+	lv_obj_set_style_bg_color(cpu_lb, lv_color_hex(0x000000), 0);
+	lv_obj_set_style_bg_opa(cpu_lb, LV_OPA_70, 0);
+	lv_obj_set_style_pad_all(cpu_lb, 2, 0);
+	lv_obj_align(cpu_lb, LV_ALIGN_TOP_RIGHT, -3, 3);
 
 	/* ---- 检测框（预建 8 个，靠显示/隐藏切换）---- */
 	for (int i = 0; i < MAX_DRAW; i++) {
@@ -291,6 +346,7 @@ static lv_obj_t *build_yolo(void)
 		lv_label_set_text(box_lb[i], "");
 		lv_obj_add_flag(box_lb[i], LV_OBJ_FLAG_HIDDEN);
 	}
+	lv_obj_move_foreground(cpu_lb);
 
 	/* ---- 状态条 ---- */
 	lv_obj_t *row = lv_obj_create(body);
@@ -316,6 +372,7 @@ static lv_obj_t *build_yolo(void)
 
 	last_yolo_seq = 0;
 	poll_timer = lv_timer_create(poll_cb, 100, NULL);
+	lv_timer_create(cpu_cb, 1000, NULL);
 
 	return scr;
 }

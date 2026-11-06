@@ -267,6 +267,23 @@ void letterbox(const uint8_t *src, int sw, int sh,
 	*out_ratio = ratio;
 
 	std::memset(g_in_ptr, kPadValue, static_cast<size_t>(kNetW) * kNetH * 3);
+	if (sw == 320 && sh == 240 && nw == 640 && nh == 480) {
+		/* 常用尺寸正好放大两倍：每行复制一次，下一行直接 memcpy。 */
+		for (int y = 0; y < sh; y++) {
+			const uint8_t *sp = src + static_cast<size_t>(y) * sw * 3;
+			uint8_t *dp = g_in_ptr +
+				(static_cast<size_t>(y * 2 + pad_y) * kNetW + pad_x) * 3;
+			for (int x = 0; x < sw; x++) {
+				const uint8_t *p = sp + x * 3;
+				uint8_t *q = dp + x * 6;
+				q[0] = q[3] = p[0];
+				q[1] = q[4] = p[1];
+				q[2] = q[5] = p[2];
+			}
+			std::memcpy(dp + kNetW * 3, dp, kNetW * 3);
+		}
+		return;
+	}
 
 	for (int y = 0; y < nh; y++) {
 		const int sy = static_cast<int>(y / ratio);
@@ -469,11 +486,13 @@ void infer_loop()
 		float ratio = 1.f;
 
 		letterbox(g_src.data(), sw, sh, &pad_x, &pad_y, &ratio);
+		const double prep_ms = now_ms() - t0;
 
 		if (rknn_run(g_ctx, nullptr) < 0) {
 			set_error("rknn_run 失败");
 			break;
 		}
+		const double run_ms = now_ms() - t0 - prep_ms;
 
 		std::vector<yolo_box> boxes;
 
@@ -522,6 +541,9 @@ void infer_loop()
 				cnt = g_res.count;
 			}
 			set_status("%.1f fps · %d 个目标 · 推理 %d ms", fps, cnt, ms);
+			if (std::getenv("YOLO_STATS_LOG"))
+				std::printf("[yolo-timing] prep=%.1f rknn=%.1f post=%.1f ms\n",
+					    prep_ms, run_ms, ms - prep_ms - run_ms);
 			frames = 0;
 			fps_t0 = now_ms();
 		}
@@ -569,7 +591,8 @@ int yolo_start(const char *model_path, const char *labels_path)
 
 void yolo_stop(void)
 {
-	if (!g_run.exchange(false))
+	const bool was_running = g_run.exchange(false);
+	if (!was_running && !g_th.joinable())
 		return;
 
 	if (g_th.joinable())

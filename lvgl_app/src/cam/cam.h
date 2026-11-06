@@ -109,9 +109,9 @@ uint32_t cam_preview(uint16_t *dst, int dst_bytes);
 void cam_rgb_enable(int on);
 
 /**
- * 拷走最新一帧整幅 RGB888（尺寸见 cam_capture_size）。
+ * 请求并拷走下一帧整幅 RGB888（尺寸见 cam_capture_size）。
  *   dst_bytes 必须 >= w*h*3，否则返回 0。
- * 返回帧序号：>0 有新帧，0 表示没开/还没出帧。
+ * 返回帧序号：>0 有尚未读取的新帧，0 表示没开或新帧尚未到达。
  */
 uint32_t cam_frame_rgb(uint8_t *dst, int dst_bytes);
 

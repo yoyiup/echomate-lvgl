@@ -271,6 +271,11 @@ void CamCapture::enable_rgb(bool on)
 			return;
 		}
 	}
+	{
+		std::lock_guard<std::mutex> lk(rgb_mutex_);
+		rgb_read_seq_ = rgb_seq_;
+	}
+	rgb_requested_.store(on, std::memory_order_release);
 	rgb_on_.store(on, std::memory_order_release);
 }
 
@@ -286,10 +291,13 @@ uint32_t CamCapture::frame_rgb(uint8_t *dst, int dst_bytes)
 
 	std::lock_guard<std::mutex> lk(rgb_mutex_);
 
-	if (rgb_seq_ == 0)
+	if (rgb_seq_ == rgb_read_seq_) {
+		rgb_requested_.store(true, std::memory_order_release);
 		return 0;
+	}
 
 	std::memcpy(dst, rgb_.data(), need);
+	rgb_read_seq_ = rgb_seq_;
 	return rgb_seq_;
 }
 
@@ -695,7 +703,9 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 	}
 
 	/* ---- YOLO 用的整幅 RGB888 ---- */
-	if (rgb_on_.load(std::memory_order_acquire) && !rgb_.empty()) {
+	if (rgb_on_.load(std::memory_order_acquire) &&
+	    rgb_requested_.exchange(false, std::memory_order_acq_rel) &&
+	    !rgb_.empty()) {
 		std::lock_guard<std::mutex> lk(rgb_mutex_);
 
 		nv12_to_rgb24(y, uv, cap_w_, cap_h_,

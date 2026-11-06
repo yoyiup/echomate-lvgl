@@ -37,6 +37,8 @@
 #include "net/weather.h"
 #include "net/timesync.h"
 #include "lv_wake_bridge.h"
+#include "cam/cam.h"
+#include "yolo/yolo_detect.h"
 
 #define W 320
 #define H 240
@@ -368,6 +370,11 @@ int main(void)
 	}
 
 	wake_bridge_deinit();
+	/* 限时运行或正常退出时，先收回推理线程和相机资源。 */
+	yolo_stop();
+	cam_rgb_enable(0);
+	if (cam_running())
+		cam_stop();
 	printf("\n=== 退出 ===\n");
 	return 0;
 }

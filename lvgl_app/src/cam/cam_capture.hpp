@@ -266,8 +266,10 @@ private:
 	 *   页面在的时候才需要，所以做成开关，进页面开、退页面关。
 	 */
 	std::atomic<bool> rgb_on_{ false };
+	std::atomic<bool> rgb_requested_{ false };
 	std::vector<uint8_t> rgb_;
 	uint32_t rgb_seq_ = 0;
+	uint32_t rgb_read_seq_ = 0;
 	mutable std::mutex rgb_mutex_;
 
 	/* 拍照请求（主线程置位，采集线程执行）*/
