@@ -234,7 +234,8 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
    `contents` 接口播种一个初始提交，之后才能用 Git Data API 批量推文件。
 6. H.265 运行组件在板上以 `/root/bin/cam_codec.tar.gz` 压缩保存（约 884KB），首次录像
    展开到 `/tmp/cam_codec` 并加载 `rga3/mpp_vcodec/rockit`。重新刷 rootfs 后需同步部署该压缩包；
-   原始文件来自 SDK 的 `media/out/lib` 与 `sysdrv/out/kernel_drv_ko`。
+   原始文件来自 SDK 的 `media/out/lib` 与 `sysdrv/out/kernel_drv_ko`。板载 BusyBox `tar`
+   不支持 `-z`，装载脚本使用 `gzip -dc | tar -xf -`；更新脚本后也要同步部署到板上。
 
 ---
 

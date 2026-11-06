@@ -11,8 +11,9 @@ OUT=/tmp/cam_codec
 }
 
 mkdir -p "$OUT" || exit 1
-if [ ! -f "$OUT/librockit.so" ]; then
-	tar -xzf "$PACK" -C "$OUT" || exit 1
+if [ ! -f "$OUT/librockit.so" ] || [ ! -f "$OUT/rockit.ko" ]; then
+	# 板载 BusyBox tar 没有 -z；gzip 解压后交给 tar 读取标准输入。
+	gzip -dc "$PACK" | tar -xf - -C "$OUT" || exit 1
 fi
 
 # librockit 的 DT_NEEDED 使用库名查找；固定链接让 dlopen 不依赖调用进程
