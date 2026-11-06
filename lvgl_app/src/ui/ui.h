@@ -59,6 +59,7 @@ extern struct ui_settings g_settings;
  */
 lv_obj_t *ui_page_home(void);		/* 主页（导航栈底）*/
 lv_obj_t *ui_page_net(void);		/* 网络连接 */
+lv_obj_t *ui_page_hotspot(void);	/* 手机热点与文件传输 */
 lv_obj_t *ui_page_volume(void);		/* 音量 */
 lv_obj_t *ui_page_about(void);		/* 固件版本 */
 lv_obj_t *ui_page_netcheck(void);	/* 网络自检（五层诊断）*/

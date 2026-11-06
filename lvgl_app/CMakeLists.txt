@@ -61,7 +61,9 @@ add_executable(lvgl_app
     src/ui/ui_selftest.c
     src/wifi/wifi_scan.cpp
     src/wifi/wifi_conn.cpp
+    src/wifi/hotspot_control.cpp
     src/ui/ui_wifidlg.c
+    src/ui/ui_hotspot.c
     src/ui/ui_netcheck.c
     src/ui/ui_weathercard.c
     src/net/netcheck.cpp

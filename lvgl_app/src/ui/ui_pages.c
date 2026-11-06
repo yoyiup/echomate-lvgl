@@ -14,6 +14,7 @@
 #include "ui.h"
 #include "../wifi/wifi_scan.h"
 #include "../wifi/wifi_conn.h"
+#include "../wifi/hotspot_control.h"
 
 /* 前置声明：net_make_ap_row 里要引用它，而它定义在后面。
  * C 是单遍扫描的，不声明就会隐式声明成 int f() 引发类型冲突。 */
@@ -126,6 +127,10 @@ static void net_make_ap_row(lv_obj_t *parent, int idx)
  */
 static void net_ap_clicked_cb(lv_event_t *e)
 {
+	if (hotspot_is_running()) {
+		ui_status("请先关闭手机热点");
+		return;
+	}
 	int idx = (int)(lv_intptr_t)lv_event_get_user_data(e);
 	const struct wifi_ap *ap;
 
@@ -214,6 +219,10 @@ static void net_rebuild_list(const struct wifi_result *r)
 static void net_rescan_cb(lv_event_t *e)
 {
 	(void)e;
+	if (hotspot_is_running()) {
+		ui_status("请先关闭手机热点");
+		return;
+	}
 	wifi_scan_start();
 	ui_status("正在扫描...");
 }
@@ -224,6 +233,10 @@ static void net_disconnect_cb(lv_event_t *e)
 	struct wifi_conn_info ci;
 
 	(void)e;
+	if (hotspot_is_running()) {
+		ui_status("请在手机传文件页关闭热点");
+		return;
+	}
 
 	wifi_conn_get(&ci);
 	if (ci.state == WIFI_CONN_CONNECTED || ci.state == WIFI_CONN_WORKING) {
@@ -232,6 +245,12 @@ static void net_disconnect_cb(lv_event_t *e)
 	} else {
 		ui_status("当前没有连接");
 	}
+}
+
+static void net_hotspot_cb(lv_event_t *e)
+{
+	(void)e;
+	ui_nav_push(ui_page_hotspot());
 }
 
 /**
@@ -247,6 +266,7 @@ static void net_disconnect_cb(lv_event_t *e)
 static void net_poll_cb(lv_timer_t *t)
 {
 	static int last_conn_seq = -1;
+	static int last_hotspot = -1;
 	struct wifi_conn_info ci;
 	struct wifi_result r;
 
@@ -254,6 +274,19 @@ static void net_poll_cb(lv_timer_t *t)
 
 	if (lv_screen_active() != page_net)
 		return;
+	if (hotspot_is_running()) {
+		if (last_hotspot != 1) {
+			last_hotspot = 1;
+			lv_label_set_text(net_card_title, "手机热点已开启");
+			lv_label_set_text(net_card_hint, "点下方「手机传文件」管理");
+		}
+		return;
+	}
+	if (last_hotspot == 1) {
+		last_hotspot = 0;
+		last_conn_seq = -1;
+		wifi_scan_start();
+	}
 
 	/* ---------- 先看连接状态（优先级更高）---------- */
 	wifi_conn_get(&ci);
@@ -371,6 +404,16 @@ static lv_obj_t *build_net(void)
 	lv_obj_set_style_text_color(dl, UI_C_TEXT, 0);
 	lv_obj_center(dl);
 
+	/* 与主页相同的入口，网络页也能直接进入热点管理。 */
+	lv_obj_t *hotspot_btn = lv_button_create(body);
+	lv_obj_set_size(hotspot_btn, lv_pct(100), 30);
+	lv_obj_set_style_bg_color(hotspot_btn, UI_C_ACCENT, 0);
+	lv_obj_add_event_cb(hotspot_btn, net_hotspot_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *hotspot_text = lv_label_create(hotspot_btn);
+	lv_label_set_text(hotspot_text, "手机传文件 / 热点");
+	lv_obj_set_style_text_color(hotspot_text, lv_color_hex(0x0A1628), 0);
+	lv_obj_center(hotspot_text);
+
 	/* ---- AP 列表（可滚动，动态填充）---- */
 	net_list = lv_obj_create(body);
 	lv_obj_set_width(net_list, lv_pct(100));
@@ -390,7 +433,8 @@ static lv_obj_t *build_net(void)
 	lv_timer_create(net_poll_cb, 200, NULL);
 
 	/* 进页面就扫一次 */
-	wifi_scan_start();
+	if (!hotspot_is_running())
+		wifi_scan_start();
 
 	return scr;
 }

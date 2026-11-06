@@ -172,6 +172,8 @@ int ui_goto(const char *name)
 		scr = ui_page_home();
 	else if (strcmp(name, "net") == 0)
 		scr = ui_page_net();
+	else if (strcmp(name, "hotspot") == 0)
+		scr = ui_page_hotspot();
 	else if (strcmp(name, "volume") == 0)
 		scr = ui_page_volume();
 	else if (strcmp(name, "about") == 0)

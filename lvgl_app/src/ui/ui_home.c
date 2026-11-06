@@ -187,6 +187,7 @@ static lv_obj_t *build_home(void)
 
 	/* 跳转类：bind_field=NULL 表示右侧画 ">" */
 	ui_make_row(body_list, "网络连接", NULL, goto_page_cb, (void *)ui_page_net);
+	ui_make_row(body_list, "手机传文件", NULL, goto_page_cb, (void *)ui_page_hotspot);
 	ui_make_row(body_list, "网络自检", NULL, goto_page_cb, (void *)ui_page_netcheck);
 	ui_make_row(body_list, "音量",     NULL, goto_page_cb, (void *)ui_page_volume);
 
