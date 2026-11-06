@@ -180,6 +180,8 @@ int ui_goto(const char *name)
 		scr = ui_page_netcheck();
 	else if (strcmp(name, "camera") == 0)
 		scr = ui_page_camera();
+	else if (strcmp(name, "gallery") == 0)
+		scr = ui_page_gallery();
 	else if (strcmp(name, "motor") == 0)
 		scr = ui_page_motortest();
 	else if (strcmp(name, "yolo") == 0)

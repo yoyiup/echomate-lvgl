@@ -194,6 +194,7 @@ static lv_obj_t *build_home(void)
 	 * 原来这里挂的是 g_settings.camera 开关（只有"开/关"没有界面），
 	 * 现在改成跳转入口 —— 和网络/音量那几行同一种用法。 */
 	ui_make_row(body_list, "摄像头", NULL, goto_page_cb, (void *)ui_page_camera);
+	ui_make_row(body_list, "相册", NULL, goto_page_cb, (void *)ui_page_gallery);
 
 	/* 电机测试：手动点按验证 /dev/echo_motor（两路 H 桥）。
 	 * 属于"硬件调试入口"，平时不会用，排查接线时最有用。 */

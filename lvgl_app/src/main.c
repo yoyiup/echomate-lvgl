@@ -266,7 +266,7 @@ int main(void)
 		printf("[4.5] 语音状态标签已显示（LVGL_DEBUG_LABEL=1）\n");
 	}
 
-	/* 调试开关：LVGL_START_PAGE=net|netcheck|volume|about|camera 可以跳过点击，
+	/* 调试开关：LVGL_START_PAGE=net|netcheck|volume|about|camera|gallery 可以跳过点击，
 	 * 启动后直接显示某个子页。
 	 * 为什么需要：在 2.4 寸屏上用手指精确点中某一行很难，
 	 * 改完 UI 想单独看网络页长什么样，有这个开关就不用反复试。
@@ -278,7 +278,7 @@ int main(void)
 			/* 强制立刻排布一次，否则下面的尺寸查询全是 0 */
 			lv_obj_update_layout(lv_screen_active());
 		} else {
-			printf("[4] 警告: 未知页面名 '%s'（可用 home/net/netcheck/volume/about/camera）\n",
+	printf("[4] 警告: 未知页面名 '%s'（可用 home/net/netcheck/volume/about/camera/gallery）\n",
 			       env);
 		}
 	}

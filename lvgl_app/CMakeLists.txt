@@ -113,6 +113,7 @@ add_executable(lvgl_app
     src/cam/cam_image.cpp
     src/cam/h265_recorder.cpp
     src/ui/ui_camera.c
+    src/ui/ui_gallery.c
     # ===== 电机（D1：/dev/echo_motor，两路 GPIO H 桥）=====
     # motor_ctl.cpp  用户态唯一入口：open/ioctl 封装 + RAII + 中文错误
     #                ★ 枚举和 ioctl 号直接来自 kernel/my/motor_uapi.h，

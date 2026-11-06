@@ -63,6 +63,7 @@ lv_obj_t *ui_page_volume(void);		/* 音量 */
 lv_obj_t *ui_page_about(void);		/* 固件版本 */
 lv_obj_t *ui_page_netcheck(void);	/* 网络自检（五层诊断）*/
 lv_obj_t *ui_page_camera(void);		/* 摄像头：预览 + 拍照 + 录像 */
+lv_obj_t *ui_page_gallery(void);	/* 相册：浏览摄像头保存的照片与录像 */
 lv_obj_t *ui_page_motortest(void);	/* 电机：两路 H 桥正/反/停 + 全部停止 */
 lv_obj_t *ui_page_yolo(void);		/* YOLO 相机：实时检测框（NPU）*/
 lv_obj_t *ui_page_aichat(void);		/* AI 对话：语音链路入口 */
