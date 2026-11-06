@@ -278,7 +278,7 @@ int main(void)
 			/* 强制立刻排布一次，否则下面的尺寸查询全是 0 */
 			lv_obj_update_layout(lv_screen_active());
 		} else {
-	printf("[4] 警告: 未知页面名 '%s'（可用 home/net/netcheck/volume/about/camera/gallery）\n",
+			printf("[4] 警告: 未知页面名 '%s'（可用 home/net/netcheck/volume/about/camera/gallery）\n",
 			       env);
 		}
 	}
