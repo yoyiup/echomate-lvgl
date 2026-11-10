@@ -232,7 +232,9 @@ private:
 
 	/* ---- 线程 ---- */
 	void capture_loop();
-	void handle_frame(const uint8_t *y, const uint8_t *uv);
+	bool handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd, size_t bytes);
+	bool queue_buffer(unsigned int index);
+	void requeue_venc_buffers();
 
 	void set_error(const char *fmt, ...);
 	static int xioctl(int fd, unsigned long req, void *arg);
@@ -240,6 +242,8 @@ private:
 	/* ---- 资源（声明顺序 = 析构逆序，要注意依赖）---- */
 	UniqueFd fd_;
 	std::vector<MappedBuffer> bufs_;
+	std::vector<UniqueFd> dmabuf_fds_;
+	std::vector<bool> venc_held_;
 	bool stream_on_ = false;
 
 	void *aiq_ctx_ = nullptr;           /* rk_aiq_sys_ctx_t*，避免头文件外泄 */

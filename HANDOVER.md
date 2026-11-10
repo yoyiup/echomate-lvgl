@@ -1,6 +1,6 @@
 # Echo-Mate 项目交接文档
 
-> 最后更新：2026-11-06 · 代码仓库：https://github.com/yoyiup/echomate-lvgl
+> 最后更新：2026-11-10 · 代码仓库：https://github.com/yoyiup/echomate-lvgl
 >
 > 本文面向**接手这块板子的人**：先讲清楚东西在哪、怎么跑起来，再讲架构约定和踩过的坑。
 > 只想要最小路径的，直接看第 0 节；要排查问题的，跳到第 7 节。
@@ -178,7 +178,7 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
 
 | 模块 | 入口 / 设备 | 关键开关与注意 |
 |---|---|---|
-| 相机 | `/dev/video*`、`rkaiq` 3A | 驱动**不开机自启**，靠 `load_camera()`；界面报"打开失败"先 `ls /dev/video*`。页面提供 AVI 与 H265 两种录像：H265 使用 RV1106 VENC 硬编，停止后由 ffmpeg 无重编码封装 MP4；首次使用会运行 `/root/bin/load_h265.sh`。实测 3A 是 2A（AE+AWB，定焦无 AF），9 线程；`CAM_AIQ=off` 对照：开亮度 113.6 正常色、关 41.7 发绿 |
+| 相机 | `/dev/video*`、`rkaiq` 3A | 驱动**不开机自启**，靠 `load_camera()`；界面报"打开失败"先 `ls /dev/video*`。页面提供 AVI 与 H265 两种录像：**H265 走 MPP 硬编 + DMA-BUF 零拷贝**（V4L2 帧不经过 CPU，`dup` 隔离 fd 所有权后交给 VENC），停止后 ffmpeg 无重编码封装 MP4；首次使用会运行 `/root/bin/load_h265.sh`。**已板端验证**：63 帧 / 2.10 秒 / 30fps / 画面有效。详见 `docs/H265录像模块交接.md`。实测 3A 是 2A（AE+AWB，定焦无 AF），9 线程；`CAM_AIQ=off` 对照：开亮度 113.6 正常色、关 41.7 发绿 |
 | YOLO | `rknpu.ko` + `librknnmrt.so` + `yolov5.rknn` | **板上原本没有 NPU 驱动**，SDK 里 `CONFIG_ROCKCHIP_RKNPU=m` 编出 `.ko` 直接 insmod；**没加自启，重启后要手动 insmod**。只能零拷贝，输入 UINT8，量化公式 `q = f32/scale + zp`（`zp=-128, scale=1/255`），搞反一个框都检不出 |
 | 电机 | `/dev/echo_motor`，GPIO 32/33(左)、35/36(右) | ioctl 只有 SET/GET/STOP_ALL，语义是"设方向，写一次一直转"，**离开页面必须停**。命令行 `tools/motor_test` 比点屏可靠 |
 | 音频 | 片内 acodec (`card 0: rvacodec`) | 不用自己写驱动；硬件只支持 **2/4 声道**，`-c 1` 报错，**右声道恒为 0**；功放 `GPIO0_A2 ACTIVE_LOW` 驱动自动管 |
@@ -221,6 +221,7 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
 | 连着 WiFi 却上不了网 | 关联 ≠ 能上网。三层分别验；最常见是旧网段 IP 残留导致 DHCP 被跳过 |
 | 喊不醒 / 没喊也响 | 灵敏度与能量兜底；用「唤醒」按钮和 `AICHAT_AUTOWAKE` 定位，量化 rms 判断是不是电平问题 |
 | `timeout xxx` 没输出 | busybox 的 `timeout` 会静默不执行，禁用 |
+| H.265 只有 `.h265` 没有 `.mp4`、也没有"录像结束" | `stop()` 没被调用。常见根因是 **V4L2 的 DMA-BUF fd 被 MPP 关掉了**（import 接管所有权），4 帧后 ISP 停帧 → 秒数不前进 → 自动停止不触发。看心跳 `alive=0` 即中招，见 `docs/H265录像模块交接.md` §4.1 |
 
 ---
 
@@ -244,6 +245,10 @@ wc -c /root/lvgl_app           # 与宿主 `wc -c` 对比，不一致就是没�
 
 工程内 `docs/`：
 
+- **`H265录像模块交接.md`** — H.265 零拷贝录像的模块级交接：数据路径、代码地图、
+  五个设计决策、实测基线、参数调整、排查表、红线（**动录像前先读**）
+- `功能学习记录/H265摄像头DMA-BUF零拷贝-2026-11-10.md` — 零拷贝设计 + fd 所有权踩坑全过程
+- `功能学习记录/H265输入MMZ缓冲池优化-2026-11-10.md` — 改造前的 MMZ 副本方案对比
 - `D10-3摄像头问题排查记录.md`（1145 行 / 30 个问题，五层分类 + 决策树，**动摄像头前先读**）
 - `D10-1` / `D10-2` 摄像头与 V4L2 subdev 实验操作单、`D4` 中断、`D6` 设备树、`D9-1` poll
 - `板上速查.md`、`Linux命令行速查.md`、`集成到LVGL.md`、`应用层七课.md`

@@ -3,35 +3,49 @@
 #include <cerrno>
 #include <cstring>
 #include <dlfcn.h>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "resources.hpp"
 
 extern "C" {
-#include "rk_mpi_mb.h"
-#include "rk_mpi_sys.h"
-#include "rk_mpi_venc.h"
+#include <rockchip/mpp_buffer.h>
+#include <rockchip/mpp_frame.h>
+#include <rockchip/rk_mpi.h>
+#include <rockchip/rk_mpi_mb_cmd.h>
+#include <rockchip/rk_venc_cfg.h>
+#include <rockchip/rk_venc_cmd.h>
+#include <rockchip/rk_venc_rc.h>
 }
 
 namespace camp {
 
-static constexpr int kVencChannel = 0;
 static constexpr const char *kCodecDir = "/tmp/cam_codec";
+static constexpr const char *kTag = "echomate_zero_copy";
 
 struct H265Recorder::Api {
-	RK_S32 (*sys_init)(void);
-	RK_S32 (*sys_exit)(void);
-	RK_S32 (*mmz_alloc)(MB_BLK *, const RK_CHAR *, const RK_CHAR *, RK_U32);
-	RK_S32 (*mmz_free)(MB_BLK);
-	RK_S32 (*flush)(MB_BLK, RK_BOOL);
-	RK_VOID *(*mb_addr)(MB_BLK);
-	RK_S32 (*create)(VENC_CHN, const VENC_CHN_ATTR_S *);
-	RK_S32 (*destroy)(VENC_CHN);
-	RK_S32 (*start_recv)(VENC_CHN, const VENC_RECV_PIC_PARAM_S *);
-	RK_S32 (*stop_recv)(VENC_CHN);
-	RK_S32 (*send)(VENC_CHN, const VIDEO_FRAME_INFO_S *, RK_S32);
-	RK_S32 (*get)(VENC_CHN, VENC_STREAM_S *, RK_S32);
-	RK_S32 (*release)(VENC_CHN, VENC_STREAM_S *);
+	MPP_RET (*create)(MppCtx *, MppApi **);
+	MPP_RET (*init)(MppCtx, MppCtxType, MppCodingType);
+	MPP_RET (*destroy)(MppCtx);
+	MPP_RET (*buffer_import)(MppBufferGroup, MppBufferInfo *, MppBuffer *,
+				 const char *, const char *);
+	MPP_RET (*buffer_put)(MppBuffer, const char *);
+	MPP_RET (*frame_init)(MppFrame *);
+	MPP_RET (*frame_deinit)(MppFrame *);
+	void (*frame_width)(MppFrame, RK_U32);
+	void (*frame_height)(MppFrame, RK_U32);
+	void (*frame_hstride)(MppFrame, RK_U32);
+	void (*frame_vstride)(MppFrame, RK_U32);
+	void (*frame_fmt)(MppFrame, MppFrameFormat);
+	void (*frame_pts)(MppFrame, RK_S64);
+	void (*frame_buffer)(MppFrame, MppBuffer);
+	MPP_RET (*cfg_init)(MppEncCfg *);
+	MPP_RET (*cfg_deinit)(MppEncCfg);
+	MPP_RET (*cfg_s32)(MppEncCfg, const char *, RK_S32);
+	MPP_RET (*cfg_u32)(MppEncCfg, const char *, RK_U32);
 };
 
 template <typename T>
@@ -45,11 +59,9 @@ H265Recorder::~H265Recorder()
 {
 	if (active_.load())
 		stop();
+	else
+		cleanup_encoder();
 	delete api_;
-	if (rockit_lib_)
-		::dlclose(rockit_lib_);
-	if (rga_lib_)
-		::dlclose(rga_lib_);
 	if (mpp_lib_)
 		::dlclose(mpp_lib_);
 }
@@ -59,39 +71,39 @@ int H265Recorder::load_api()
 	if (api_)
 		return 0;
 
-	const std::string mpp = std::string(kCodecDir) + "/librockchip_mpp.so.1";
-	const std::string rga = std::string(kCodecDir) + "/librga.so";
-	const std::string rockit = std::string(kCodecDir) + "/librockit.so";
-
-	mpp_lib_ = ::dlopen(mpp.c_str(), RTLD_NOW | RTLD_GLOBAL);
-	rga_lib_ = ::dlopen(rga.c_str(), RTLD_NOW | RTLD_GLOBAL);
-	rockit_lib_ = ::dlopen(rockit.c_str(), RTLD_NOW | RTLD_GLOBAL);
-	if (!mpp_lib_ || !rga_lib_ || !rockit_lib_) {
+	const std::string path = std::string(kCodecDir) + "/librockchip_mpp.so.1";
+	mpp_lib_ = ::dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+	if (!mpp_lib_) {
 		const char *why = ::dlerror();
-		error_ = std::string("H265 运行库未就绪: ") + (why ? why : "dlopen");
+		error_ = std::string("MPP 运行库未就绪: ") + (why ? why : "dlopen");
 		return -1;
 	}
 
 	api_ = new Api{};
-#define LOAD(name, field) if (!sym(rockit_lib_, name, api_->field)) goto missing
-	LOAD("RK_MPI_SYS_Init", sys_init);
-	LOAD("RK_MPI_SYS_Exit", sys_exit);
-	LOAD("RK_MPI_SYS_MmzAlloc_Cached", mmz_alloc);
-	LOAD("RK_MPI_SYS_MmzFree", mmz_free);
-	LOAD("RK_MPI_SYS_MmzFlushCache", flush);
-	LOAD("RK_MPI_MB_Handle2VirAddr", mb_addr);
-	LOAD("RK_MPI_VENC_CreateChn", create);
-	LOAD("RK_MPI_VENC_DestroyChn", destroy);
-	LOAD("RK_MPI_VENC_StartRecvFrame", start_recv);
-	LOAD("RK_MPI_VENC_StopRecvFrame", stop_recv);
-	LOAD("RK_MPI_VENC_SendFrame", send);
-	LOAD("RK_MPI_VENC_GetStream", get);
-	LOAD("RK_MPI_VENC_ReleaseStream", release);
+#define LOAD(name, field) if (!sym(mpp_lib_, name, api_->field)) goto missing
+	LOAD("mpp_create", create);
+	LOAD("mpp_init", init);
+	LOAD("mpp_destroy", destroy);
+	LOAD("mpp_buffer_import_with_tag", buffer_import);
+	LOAD("mpp_buffer_put_with_caller", buffer_put);
+	LOAD("mpp_frame_init", frame_init);
+	LOAD("mpp_frame_deinit", frame_deinit);
+	LOAD("mpp_frame_set_width", frame_width);
+	LOAD("mpp_frame_set_height", frame_height);
+	LOAD("mpp_frame_set_hor_stride", frame_hstride);
+	LOAD("mpp_frame_set_ver_stride", frame_vstride);
+	LOAD("mpp_frame_set_fmt", frame_fmt);
+	LOAD("mpp_frame_set_pts", frame_pts);
+	LOAD("mpp_frame_set_buffer", frame_buffer);
+	LOAD("mpp_enc_cfg_init", cfg_init);
+	LOAD("mpp_enc_cfg_deinit", cfg_deinit);
+	LOAD("mpp_enc_cfg_set_s32", cfg_s32);
+	LOAD("mpp_enc_cfg_set_u32", cfg_u32);
 #undef LOAD
 	return 0;
 
 missing:
-	error_ = "H265 运行库接口不完整";
+	error_ = "MPP 运行库接口不完整";
 	delete api_;
 	api_ = nullptr;
 	return -1;
@@ -101,12 +113,10 @@ int H265Recorder::start(const std::string &mp4_path, int width, int height, int 
 {
 	if (active_.load() || mp4_path.empty() || width <= 0 || height <= 0)
 		return -1;
-	/* 编码组件压缩保存在闪存，首次录像时展开/装载。这样普通相机预览
-	 * 不额外占用 tmpfs，也不要求守护脚本设置动态库环境。 */
+
 	if (::access("/dev/mpi/valloc", R_OK | W_OK) != 0 ||
-	    ::access((std::string(kCodecDir) + "/librockit.so").c_str(), R_OK) != 0 ||
-	    ::access("/usr/lib/librockchip_mpp.so.1", R_OK) != 0 ||
-	    ::access("/usr/lib/librga.so", R_OK) != 0) {
+	    ::access("/dev/mpi/venc", R_OK | W_OK) != 0 ||
+	    ::access((std::string(kCodecDir) + "/librockchip_mpp.so.1").c_str(), R_OK) != 0) {
 		char output[256];
 		const char *const argv[] = { "/root/bin/load_h265.sh", nullptr };
 		if (res::run_argv(argv, output, sizeof(output), true) != 0) {
@@ -116,11 +126,6 @@ int H265Recorder::start(const std::string &mp4_path, int width, int height, int 
 	}
 	if (load_api() != 0)
 		return -1;
-	if (::access("/dev/mpp_service", R_OK | W_OK) != 0 ||
-	    ::access("/dev/mpi/valloc", R_OK | W_OK) != 0) {
-		error_ = "H265 编码驱动未加载";
-		return -1;
-	}
 
 	width_ = width;
 	height_ = height;
@@ -135,117 +140,229 @@ int H265Recorder::start(const std::string &mp4_path, int width, int height, int 
 		error_ = "无法创建 H265 临时文件";
 		return -1;
 	}
-
-	if (api_->sys_init() != RK_SUCCESS) {
-		error_ = "RK_MPI_SYS_Init 失败";
+	valloc_fd_ = ::open("/dev/mpi/valloc", O_RDWR | O_CLOEXEC);
+	if (valloc_fd_ < 0) {
+		error_ = "无法打开 MPP 输出缓冲设备";
 		cleanup_encoder();
 		return -1;
 	}
-	sys_inited_ = true;
 
-	VENC_CHN_ATTR_S attr{};
-	attr.stVencAttr.enType = RK_VIDEO_ID_HEVC;
-	attr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;
-	attr.stVencAttr.u32MaxPicWidth = width_;
-	attr.stVencAttr.u32MaxPicHeight = height_;
-	attr.stVencAttr.u32PicWidth = width_;
-	attr.stVencAttr.u32PicHeight = height_;
-	attr.stVencAttr.u32VirWidth = (width_ + 1) & ~1;
-	attr.stVencAttr.u32VirHeight = (height_ + 1) & ~1;
-	attr.stVencAttr.u32StreamBufCnt = 3;
-	attr.stVencAttr.u32BufSize = width_ * height_ * 3 / 2;
-	attr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
-	attr.stRcAttr.stH265Cbr.u32Gop = fps_;
-	attr.stRcAttr.stH265Cbr.u32BitRate = 512; /* 320x240：512 kbps */
-	attr.stRcAttr.stH265Cbr.fr32DstFrameRateNum = fps_;
-	attr.stRcAttr.stH265Cbr.fr32DstFrameRateDen = 1;
-	attr.stRcAttr.stH265Cbr.u32SrcFrameRateNum = fps_;
-	attr.stRcAttr.stH265Cbr.u32SrcFrameRateDen = 1;
-
-	if (api_->create(kVencChannel, &attr) != RK_SUCCESS) {
-		error_ = "创建 H265 硬件编码通道失败";
+	MppCtx ctx = nullptr;
+	MppApi *mpi = nullptr;
+	if (api_->create(&ctx, &mpi) != MPP_OK || !ctx || !mpi) {
+		error_ = "mpp_create 失败";
 		cleanup_encoder();
 		return -1;
 	}
-	channel_created_ = true;
+	mpp_ctx_ = ctx;
+	mpp_api_ = mpi;
 
-	VENC_RECV_PIC_PARAM_S recv{};
-	recv.s32RecvPicNum = -1;
-	if (api_->start_recv(kVencChannel, &recv) != RK_SUCCESS) {
-		error_ = "启动 H265 编码通道失败";
+	if (api_->init(ctx, MPP_CTX_ENC, MPP_VIDEO_CodingHEVC) != MPP_OK) {
+		error_ = "mpp_init H265 失败";
 		cleanup_encoder();
 		return -1;
 	}
+
+	MppEncCfg cfg = nullptr;
+	if (api_->cfg_init(&cfg) != MPP_OK ||
+	    mpi->control(ctx, MPP_ENC_GET_CFG, cfg) != MPP_OK) {
+		error_ = "读取 MPP 编码配置失败";
+		cleanup_encoder();
+		return -1;
+	}
+	mpp_cfg_ = cfg;
+
+	const int bps = 512 * 1000;
+	api_->cfg_s32(cfg, "prep:width", width_);
+	api_->cfg_s32(cfg, "prep:height", height_);
+	api_->cfg_s32(cfg, "prep:hor_stride", width_);
+	api_->cfg_s32(cfg, "prep:ver_stride", height_);
+	api_->cfg_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+	api_->cfg_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+	api_->cfg_s32(cfg, "rc:fps_in_flex", 0);
+	api_->cfg_s32(cfg, "rc:fps_in_num", fps_);
+	api_->cfg_s32(cfg, "rc:fps_in_denorm", 1);
+	api_->cfg_s32(cfg, "rc:fps_out_flex", 0);
+	api_->cfg_s32(cfg, "rc:fps_out_num", fps_);
+	api_->cfg_s32(cfg, "rc:fps_out_denorm", 1);
+	api_->cfg_s32(cfg, "rc:gop", fps_);
+	api_->cfg_s32(cfg, "rc:bps_target", bps);
+	api_->cfg_s32(cfg, "rc:bps_max", bps * 17 / 16);
+	api_->cfg_s32(cfg, "rc:bps_min", bps * 15 / 16);
+	api_->cfg_u32(cfg, "rc:drop_mode", MPP_ENC_RC_DROP_FRM_DISABLED);
+	api_->cfg_s32(cfg, "rc:qp_init", 26);
+	api_->cfg_s32(cfg, "rc:qp_max", 51);
+	api_->cfg_s32(cfg, "rc:qp_min", 10);
+	api_->cfg_s32(cfg, "rc:qp_max_i", 51);
+	api_->cfg_s32(cfg, "rc:qp_min_i", 10);
+	api_->cfg_s32(cfg, "rc:qp_ip", 2);
+	api_->cfg_s32(cfg, "codec:type", MPP_VIDEO_CodingHEVC);
+
+	if (mpi->control(ctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) {
+		error_ = "设置 MPP H265 参数失败";
+		cleanup_encoder();
+		return -1;
+	}
+	MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+	mpi->control(ctx, MPP_ENC_SET_HEADER_MODE, &header_mode);
 
 	active_.store(true);
-	output_thread_ = std::thread(&H265Recorder::output_loop, this);
 	return 0;
 }
 
-int H265Recorder::submit(const uint8_t *y, const uint8_t *uv, uint64_t pts_us)
+int H265Recorder::submit_dmabuf(int fd, uint8_t *addr, size_t bytes,
+				uint64_t pts_us)
 {
-	if (!active_.load() || !y || !uv)
+	const size_t need = static_cast<size_t>(width_) * height_ * 3 / 2;
+	if (!active_.load() || fd < 0 || !addr || bytes < need)
 		return -1;
 
-	const size_t y_size = static_cast<size_t>(width_) * height_;
-	const size_t frame_size = y_size * 3 / 2;
-	MB_BLK block = RK_NULL;
-	if (api_->mmz_alloc(&block, "cam_h265", nullptr,
-			    static_cast<RK_U32>(frame_size)) != RK_SUCCESS || !block)
-		return -1;
+	const int fno = frames_.load();
 
-	auto *dst = static_cast<uint8_t *>(api_->mb_addr(block));
-	if (!dst) {
-		api_->mmz_free(block);
+	auto *mpi = static_cast<MppApi *>(mpp_api_);
+	auto ctx = static_cast<MppCtx>(mpp_ctx_);
+	/*
+	 * ★★★ 根因（2026-11-10 实测）：mpp_buffer_import_with_tag() 会接管
+	 * info.fd 的所有权，buffer_put() 时把它 close 掉。直接传 V4L2 的
+	 * DMA-BUF fd，等于每帧关掉一个 V4L2 buffer 的 fd —— 4 帧后
+	 * fd 8/9/10/11 全关、ISP 不再出帧、采集线程永远卡在 poll()。
+	 * 只把 dup 出来的副本交给 MPP；dup 指向同一块 dma_buf（同一物理
+	 * 内存），仍然是零拷贝，没有引入任何帧拷贝。
+	 */
+	const int import_fd = ::dup(fd);
+	if (import_fd < 0) {
+		error_ = "dup 摄像头 DMA-BUF fd 失败";
 		return -1;
 	}
-	std::memcpy(dst, y, y_size);
-	std::memcpy(dst + y_size, uv, frame_size - y_size);
-	api_->flush(block, RK_FALSE);
 
-	VIDEO_FRAME_INFO_S frame{};
-	frame.stVFrame.pMbBlk = block;
-	frame.stVFrame.u32Width = width_;
-	frame.stVFrame.u32Height = height_;
-	frame.stVFrame.u32VirWidth = width_;
-	frame.stVFrame.u32VirHeight = height_;
-	frame.stVFrame.enPixelFormat = RK_FMT_YUV420SP;
-	frame.stVFrame.enCompressMode = COMPRESS_MODE_NONE;
-	frame.stVFrame.u64PTS = pts_us;
+	MppBufferInfo info{};
+	info.type = MPP_BUFFER_TYPE_ION;
+	info.size = bytes;
+	info.ptr = addr;
+	info.fd = import_fd;
+	info.index = -1;
 
-	const RK_S32 rc = api_->send(kVencChannel, &frame, 100);
-	api_->mmz_free(block);
-	return rc == RK_SUCCESS ? 0 : -1;
-}
-
-void H265Recorder::output_loop()
-{
-	VENC_PACK_S pack{};
-	VENC_STREAM_S stream{};
-	stream.pstPack = &pack;
-
-	while (active_.load()) {
-		if (api_->get(kVencChannel, &stream, 100) != RK_SUCCESS)
-			continue;
-		void *data = api_->mb_addr(pack.pMbBlk);
-		if (data && pack.u32Len && raw_file_) {
-			std::fwrite(data, 1, pack.u32Len, raw_file_);
-			frames_.fetch_add(1);
-		}
-		api_->release(kVencChannel, &stream);
+	MppBuffer buffer = nullptr;
+	MPP_RET rc = api_->buffer_import(nullptr, &info, &buffer, kTag,
+					 "submit_dmabuf");
+	if (rc != MPP_OK || !buffer) {
+		::close(import_fd);	/* MPP 未接管，副本自己收 */
+		std::fprintf(stderr,
+			     "[APP ] H265 零拷贝：导入 DMA-BUF 失败 rc=%d\n", rc);
+		error_ = "MPP 导入摄像头 DMA-BUF 失败";
+		return -1;
 	}
+
+	MppFrame frame = nullptr;
+	rc = api_->frame_init(&frame);
+	if (rc == MPP_OK && frame) {
+		api_->frame_width(frame, width_);
+		api_->frame_height(frame, height_);
+		api_->frame_hstride(frame, width_);
+		api_->frame_vstride(frame, height_);
+		api_->frame_fmt(frame, MPP_FMT_YUV420SP);
+		api_->frame_pts(frame, static_cast<RK_S64>(pts_us));
+		api_->frame_buffer(frame, buffer);
+		rc = mpi->encode_put_frame(ctx, frame);
+		api_->frame_deinit(&frame);
+	} else {
+		rc = MPP_NOK;
+	}
+	/*
+	 * put_frame 返回后即可 put 输入 buffer。SDK 把 encode_put_frame 标注为
+	 * async 接口，但 RV1106 这版 MPP 实际是阻塞输入模式：返回时 VENC 已读完
+	 * 像素。板端实测 63 帧连续录制无花屏/撕裂，且 buffer_put 后 V4L2 原 fd
+	 * 仍 alive（配合上面的 dup），据此确认可立即归还。
+	 */
+	api_->buffer_put(buffer, "submit_dmabuf");
+	if (rc != MPP_OK) {
+		char msg[96];
+		std::snprintf(msg, sizeof(msg), "MPP 提交 DMA-BUF 失败: rc=%d", rc);
+		error_ = msg;
+		return -1;
+	}
+
+	struct venc_packet packet_data{};
+	MppPacket packet = reinterpret_cast<MppPacket>(&packet_data);
+	rc = mpi->encode_get_packet(ctx, &packet);
+	if (rc != MPP_OK || !packet_data.len) {
+		char msg[96];
+		std::snprintf(msg, sizeof(msg), "MPP 获取 H265 码流失败: rc=%d", rc);
+		error_ = msg;
+		if (rc == MPP_OK)
+			mpi->encode_release_packet(ctx, &packet);
+		return -1;
+	}
+
+	struct valloc_mb mb{};
+	mb.mpi_buf_id = static_cast<int>(packet_data.u64priv_data);
+	mb.struct_size = sizeof(mb);
+	if (::ioctl(valloc_fd_, VALLOC_IOCTL_MB_GET_FD, &mb) < 0 ||
+	    mb.dma_buf_fd < 0) {
+		error_ = "MPP 输出 DMA-BUF 映射失败";
+		mpi->encode_release_packet(ctx, &packet);
+		return -1;
+	}
+	void *mapped = ::mmap(nullptr, packet_data.buf_size, PROT_READ,
+			      MAP_SHARED, mb.dma_buf_fd, 0);
+	if (mapped == MAP_FAILED) {
+		::close(mb.dma_buf_fd);
+		error_ = "MPP 输出码流 mmap 失败";
+		mpi->encode_release_packet(ctx, &packet);
+		return -1;
+	}
+	size_t offset = packet_data.offset;
+	if (offset + packet_data.len > packet_data.buf_size)
+		offset = 0;
+	const size_t wrote = std::fwrite(static_cast<uint8_t *>(mapped) + offset,
+					1, packet_data.len, raw_file_);
+	std::fflush(raw_file_);
+	::munmap(mapped, packet_data.buf_size);
+	::close(mb.dma_buf_fd);
+
+	const MPP_RET rel_rc = mpi->encode_release_packet(ctx, &packet);
+	if (rel_rc != MPP_OK) {
+		error_ = "MPP 释放输出码流包失败（输出缓冲可能未回池）";
+		return -1;
+	}
+	if (wrote != packet_data.len) {
+		error_ = "写 H265 临时码流失败";
+		return -1;
+	}
+	frames_.fetch_add(1);
+	/*
+	 * 常驻心跳：每 30 帧一条，同时兼作 fd 存活哨兵。
+	 * alive=0 说明 V4L2 的 DMA-BUF fd 又被谁关掉了 —— 曾经踩过：
+	 * mpp_buffer_import_with_tag() 接管 info.fd 所有权，buffer_put() 时把
+	 * 它 close，结果 4 帧后 ISP 停止出帧、采集线程永久卡在 poll()。
+	 */
+	if ((fno + 1) % 30 == 0) {
+		const int alive = ::fcntl(fd, F_GETFD) >= 0 ? 1 : 0;
+		std::fprintf(stderr,
+			     "[APP ] H265 零拷贝：%d 帧完成，src_fd=%d alive=%d\n",
+			     fno + 1, fd, alive);
+		std::fflush(stderr);
+	}
+	return 0;
 }
 
 void H265Recorder::cleanup_encoder()
 {
-	if (channel_created_) {
-		api_->stop_recv(kVencChannel);
-		api_->destroy(kVencChannel);
-		channel_created_ = false;
+	if (mpp_cfg_) {
+		api_->cfg_deinit(static_cast<MppEncCfg>(mpp_cfg_));
+		mpp_cfg_ = nullptr;
 	}
-	if (sys_inited_) {
-		api_->sys_exit();
-		sys_inited_ = false;
+	if (mpp_ctx_) {
+		auto *mpi = static_cast<MppApi *>(mpp_api_);
+		if (mpi)
+			mpi->reset(static_cast<MppCtx>(mpp_ctx_));
+		api_->destroy(static_cast<MppCtx>(mpp_ctx_));
+		mpp_ctx_ = nullptr;
+		mpp_api_ = nullptr;
+	}
+	if (valloc_fd_ >= 0) {
+		::close(valloc_fd_);
+		valloc_fd_ = -1;
 	}
 	if (raw_file_) {
 		std::fclose(raw_file_);
@@ -276,8 +393,6 @@ int H265Recorder::stop()
 {
 	if (!active_.exchange(false))
 		return -1;
-	if (output_thread_.joinable())
-		output_thread_.join();
 	cleanup_encoder();
 	return frames_.load() > 0 ? remux_mp4() : -1;
 }

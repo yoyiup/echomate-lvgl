@@ -19,6 +19,7 @@
 
 #include "cam_capture.hpp"
 
+#include <cstdio>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdlib>
@@ -231,6 +232,8 @@ void CamCapture::teardown()
 	aiq_stop_locked();
 
 	bufs_.clear();                      /* MappedBuffer 析构 → munmap */
+	dmabuf_fds_.clear();                /* 关闭 VIDIOC_EXPBUF 导出的 fd */
+	venc_held_.clear();
 	fd_.reset();                        /* UniqueFd 析构 → close */
 
 	status_.clear();
@@ -447,6 +450,8 @@ bool CamCapture::open_device(const std::string &dev)
 	 *   自动 munmap —— 这就是 RAII 在这里的意义。
 	 */
 	bufs_.resize(n);
+	dmabuf_fds_.resize(n);
+	venc_held_.assign(n, false);
 
 	for (unsigned int i = 0; i < n; i++) {
 		v4l2_buffer b{};
@@ -470,7 +475,20 @@ bool CamCapture::open_device(const std::string &dev)
 			set_error("mmap(%u) 失败: %s", i, std::strerror(errno));
 			return false;
 		}
-		log("buffer %u: %u 字节", i, planes[0].length);
+
+		v4l2_exportbuffer exp{};
+		exp.type = kCapType;
+		exp.index = i;
+		exp.plane = 0;
+		exp.flags = O_CLOEXEC;
+		if (xioctl(fd_.get(), VIDIOC_EXPBUF, &exp) < 0) {
+			set_error("VIDIOC_EXPBUF(%u) 失败，无法零拷贝录像: %s",
+				  i, std::strerror(errno));
+			return false;
+		}
+		dmabuf_fds_[i].reset(exp.fd);
+		log("buffer %u: %u 字节，DMA-BUF fd=%d", i,
+		    planes[0].length, exp.fd);
 	}
 
 	/* 全部入队，等 STREAMON */
@@ -646,6 +664,7 @@ void CamCapture::aiq_stop_locked() { }
 void CamCapture::capture_loop()
 {
 	while (run_.load(std::memory_order_acquire)) {
+		requeue_venc_buffers();
 		pollfd pfd{};
 
 		pfd.fd = fd_.get();
@@ -656,7 +675,10 @@ void CamCapture::capture_loop()
 		 *   没帧时 DQBUF 返回 EAGAIN，纯 while 会吃满一个核，
 		 *   把单核板子上的 LVGL 和音频线程都饿死。
 		 */
-		if (::poll(&pfd, 1, 1000) <= 0)
+		/* 编码期间最多等 5ms，及时把 VENC 已用完的 DMA-BUF 还给 ISP。 */
+		const int timeout_ms = rec_on_.load(std::memory_order_acquire) &&
+			rec_mode_ == RecordMode::H265Mp4 ? 5 : 1000;
+		if (::poll(&pfd, 1, timeout_ms) <= 0)
 			continue;
 
 		v4l2_buffer b{};
@@ -675,14 +697,19 @@ void CamCapture::capture_loop()
 			break;
 		}
 
+		bool held = false;
 		if (b.index < bufs_.size() && planes[0].bytesused > 0) {
 			uint8_t *base = bufs_[b.index].data();
 
 			/* NV12：Y 平面在前 (w*h)，UV 在后 (w*h/2) */
-			handle_frame(base, base + static_cast<size_t>(cap_w_) * cap_h_);
+			held = handle_frame(base,
+				base + static_cast<size_t>(cap_w_) * cap_h_,
+				dmabuf_fds_[b.index].get(), bufs_[b.index].size());
 		}
 
-		if (xioctl(fd_.get(), VIDIOC_QBUF, &b) < 0) {
+		if (held) {
+			venc_held_[b.index] = true;
+		} else if (!queue_buffer(b.index)) {
 			if (run_.load())
 				set_error("QBUF 失败: %s", std::strerror(errno));
 			break;
@@ -690,8 +717,38 @@ void CamCapture::capture_loop()
 	}
 }
 
-void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
+bool CamCapture::queue_buffer(unsigned int index)
 {
+	v4l2_buffer b{};
+	v4l2_plane planes[VIDEO_MAX_PLANES]{};
+	b.type = kCapType;
+	b.memory = V4L2_MEMORY_MMAP;
+	b.index = index;
+	b.length = VIDEO_MAX_PLANES;
+	b.m.planes = planes;
+	return xioctl(fd_.get(), VIDIOC_QBUF, &b) == 0;
+}
+
+void CamCapture::requeue_venc_buffers()
+{
+	std::lock_guard<std::mutex> lk(rec_mutex_);
+	for (size_t i = 0; i < venc_held_.size(); ++i) {
+		if (!venc_held_[i])
+			continue;
+		if (h265_.active() && !h265_.buffer_idle(dmabuf_fds_[i].get()))
+			continue;
+		if (queue_buffer(static_cast<unsigned int>(i))) {
+			venc_held_[i] = false;
+		} else if (run_.load())
+			set_error("零拷贝 buffer %u 归还失败: %s",
+				  static_cast<unsigned int>(i), std::strerror(errno));
+	}
+}
+
+bool CamCapture::handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd,
+			      size_t bytes)
+{
+	bool held_by_venc = false;
 	/* ---- 预览：写后备缓冲，写完再切换并 bump 序号 ---- */
 	{
 		std::lock_guard<std::mutex> lk(pv_mutex_);
@@ -746,7 +803,9 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 			std::lock_guard<std::mutex> lk(rec_mutex_);
 			if (rec_on_.load(std::memory_order_acquire)) {
 				if (rec_mode_ == RecordMode::H265Mp4) {
-					h265_.submit(y, uv, now * 1000);
+					held_by_venc =
+						h265_.submit_dmabuf(dmabuf_fd, y, bytes,
+								   now * 1000) == 0;
 				} else {
 					const uint64_t period = 1000 /
 						static_cast<uint64_t>(rec_fps_);
@@ -771,7 +830,7 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 		if (no_space) {
 			set_error("录像已停止：临时空间不足，先备份或清理旧视频");
 			record_stop();
-			return;
+			return held_by_venc;
 		}
 
 		/* 用单调时钟计时，不再依赖任何写死的摄像头帧率。 */
@@ -785,6 +844,8 @@ void CamCapture::handle_frame(const uint8_t *y, const uint8_t *uv)
 			}
 		}
 	}
+	/* 自动停止可能已在本函数内销毁 VENC；此时无需再延迟 QBUF。 */
+	return held_by_venc && h265_.active();
 }
 
 /* ================================================================== */

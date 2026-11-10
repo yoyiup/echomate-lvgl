@@ -2,14 +2,14 @@
 #define H265_RECORDER_HPP
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
-#include <thread>
 
 namespace camp {
 
-/* RV1106 Rockit/VENC 硬件 H.265 编码器。实现放在 .cpp，避免 Rockchip
- * 的大批 C 头文件污染摄像头主类。 */
+/* V4L2 DMA-BUF -> Rockchip MPP 硬件 H.265。输入帧不经过 CPU 复制。 */
 class H265Recorder {
 public:
 	H265Recorder() = default;
@@ -19,29 +19,29 @@ public:
 	H265Recorder &operator=(const H265Recorder &) = delete;
 
 	int start(const std::string &mp4_path, int width, int height, int fps);
-	int submit(const uint8_t *y, const uint8_t *uv, uint64_t pts_us);
+	int submit_dmabuf(int fd, uint8_t *addr, size_t bytes, uint64_t pts_us);
+	/* MPP 使用阻塞输入模式；submit 返回时硬件已读完输入 DMA-BUF。 */
+	bool buffer_idle(int) const { return true; }
 	int stop();
 	bool active() const { return active_.load(); }
 	int frames() const { return frames_.load(); }
 	const std::string &last_error() const { return error_; }
 
 private:
-	void output_loop();
-	void cleanup_encoder();
+	struct Api;
 	int load_api();
+	void cleanup_encoder();
 	int remux_mp4();
 
-	struct Api;
 	Api *api_ = nullptr;
 	void *mpp_lib_ = nullptr;
-	void *rga_lib_ = nullptr;
-	void *rockit_lib_ = nullptr;
+	void *mpp_ctx_ = nullptr;
+	void *mpp_api_ = nullptr;
+	void *mpp_cfg_ = nullptr;
 	FILE *raw_file_ = nullptr;
-	std::thread output_thread_;
+	int valloc_fd_ = -1;
 	std::atomic<bool> active_{ false };
 	std::atomic<int> frames_{ 0 };
-	bool sys_inited_ = false;
-	bool channel_created_ = false;
 	int width_ = 0;
 	int height_ = 0;
 	int fps_ = 0;
