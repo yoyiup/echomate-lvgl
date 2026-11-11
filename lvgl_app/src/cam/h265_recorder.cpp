@@ -172,7 +172,13 @@ int H265Recorder::start(const std::string &mp4_path, int width, int height, int 
 	}
 	mpp_cfg_ = cfg;
 
-	const int bps = 512 * 1000;
+	/* 以320×240的512kbps为基准按像素数缩放；640×480为2.048Mbps。
+	 * 1280×960封顶4.096Mbps：10秒raw+MP4临时双份约10MB，可在27MB
+	 * tmpfs和12MB系统安全余量内完成封装，避免再次触发OOM。 */
+	const long long scaled_bps = 512000LL * width_ * height_ /
+				      (320LL * 240);
+	const int bps = static_cast<int>(scaled_bps > 4096000LL ?
+					 4096000LL : scaled_bps);
 	api_->cfg_s32(cfg, "prep:width", width_);
 	api_->cfg_s32(cfg, "prep:height", height_);
 	api_->cfg_s32(cfg, "prep:hor_stride", width_);
@@ -268,19 +274,15 @@ int H265Recorder::submit_dmabuf(int fd, uint8_t *addr, size_t bytes,
 	} else {
 		rc = MPP_NOK;
 	}
-	/*
-	 * put_frame 返回后即可 put 输入 buffer。SDK 把 encode_put_frame 标注为
-	 * async 接口，但 RV1106 这版 MPP 实际是阻塞输入模式：返回时 VENC 已读完
-	 * 像素。板端实测 63 帧连续录制无花屏/撕裂，且 buffer_put 后 V4L2 原 fd
-	 * 仍 alive（配合上面的 dup），据此确认可立即归还。
-	 */
-	api_->buffer_put(buffer, "submit_dmabuf");
 	if (rc != MPP_OK) {
 		char msg[96];
+		api_->buffer_put(buffer, "submit_dmabuf");
 		std::snprintf(msg, sizeof(msg), "MPP 提交 DMA-BUF 失败: rc=%d", rc);
 		error_ = msg;
 		return -1;
 	}
+	/* encode_put_frame 是异步接口。必须把导入的 MppBuffer 保持到对应输出包
+	 * 取回之后；提前 buffer_put 会让 VENC 偶发读到已失效/被复用的输入。 */
 
 	struct venc_packet packet_data{};
 	MppPacket packet = reinterpret_cast<MppPacket>(&packet_data);
@@ -291,6 +293,7 @@ int H265Recorder::submit_dmabuf(int fd, uint8_t *addr, size_t bytes,
 		error_ = msg;
 		if (rc == MPP_OK)
 			mpi->encode_release_packet(ctx, &packet);
+		api_->buffer_put(buffer, "submit_dmabuf");
 		return -1;
 	}
 
@@ -301,6 +304,7 @@ int H265Recorder::submit_dmabuf(int fd, uint8_t *addr, size_t bytes,
 	    mb.dma_buf_fd < 0) {
 		error_ = "MPP 输出 DMA-BUF 映射失败";
 		mpi->encode_release_packet(ctx, &packet);
+		api_->buffer_put(buffer, "submit_dmabuf");
 		return -1;
 	}
 	void *mapped = ::mmap(nullptr, packet_data.buf_size, PROT_READ,
@@ -309,18 +313,30 @@ int H265Recorder::submit_dmabuf(int fd, uint8_t *addr, size_t bytes,
 		::close(mb.dma_buf_fd);
 		error_ = "MPP 输出码流 mmap 失败";
 		mpi->encode_release_packet(ctx, &packet);
+		api_->buffer_put(buffer, "submit_dmabuf");
 		return -1;
 	}
-	size_t offset = packet_data.offset;
-	if (offset + packet_data.len > packet_data.buf_size)
-		offset = 0;
-	const size_t wrote = std::fwrite(static_cast<uint8_t *>(mapped) + offset,
-					1, packet_data.len, raw_file_);
+	/* RV1106 的输出 DMA-BUF 是环形缓冲。一个访问单元可能从缓冲尾部跨到
+	 * 头部。旧代码遇到跨尾时直接 offset=0，等于丢掉尾部并写入错误字节，
+	 * 解码器随后会报 Could not find ref with POC。 */
+	size_t wrote = 0;
+	if (packet_data.buf_size && packet_data.offset < packet_data.buf_size &&
+	    packet_data.len <= packet_data.buf_size) {
+		const size_t tail = packet_data.buf_size - packet_data.offset;
+		const size_t first = packet_data.len < tail ? packet_data.len : tail;
+		wrote = std::fwrite(static_cast<uint8_t *>(mapped) + packet_data.offset,
+				    1, first, raw_file_);
+		if (wrote == first && packet_data.len > first)
+			wrote += std::fwrite(mapped, 1, packet_data.len - first, raw_file_);
+	}
 	std::fflush(raw_file_);
 	::munmap(mapped, packet_data.buf_size);
 	::close(mb.dma_buf_fd);
 
 	const MPP_RET rel_rc = mpi->encode_release_packet(ctx, &packet);
+	/* 输出已就绪，此时硬件必然读完本帧，才可释放导入对象。V4L2 原始
+	 * DMA-BUF 仍由采集层持有，随后再安全 QBUF 给 ISP。 */
+	api_->buffer_put(buffer, "submit_dmabuf");
 	if (rel_rc != MPP_OK) {
 		error_ = "MPP 释放输出码流包失败（输出缓冲可能未回池）";
 		return -1;

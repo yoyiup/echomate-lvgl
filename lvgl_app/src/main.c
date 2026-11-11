@@ -123,7 +123,10 @@ int main(void)
 	 */
 	static int lock_fd = -1;
 
-	lock_fd = open("/var/run/lvgl_app.lock", O_RDWR | O_CREAT, 0644);
+	/* O_CLOEXEC 很关键：热点、传输服务等子进程会 exec。若继承锁 fd，
+	 * 主程序被 OOM 杀掉后锁仍不会释放，守护进程会永远误判已有实例。 */
+	lock_fd = open("/var/run/lvgl_app.lock",
+		       O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 	if (lock_fd >= 0 &&
 	    flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
 		fprintf(stderr, "[启动] 已有 lvgl_app 在运行，本次退出（避免抢 /dev/fb0）\n");

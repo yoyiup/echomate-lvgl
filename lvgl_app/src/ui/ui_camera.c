@@ -62,6 +62,10 @@ static lv_obj_t	*canvas;
 static lv_obj_t	*btn_photo_lb;		/* 拍照按钮上的字（要能改，做反馈）*/
 static lv_obj_t	*btn_rec_lb;		/* AVI 录像按钮上的字 */
 static lv_obj_t	*btn_h265_lb;		/* H.265/MP4 录像按钮上的字 */
+static lv_obj_t	*btn_res_lb;		/* H.265分辨率：640/1280 */
+static lv_obj_t	*btn_photo;
+static lv_obj_t	*btn_rec;
+static lv_obj_t	*btn_res;
 static lv_obj_t	*status_lb;
 static lv_obj_t	*stats_lb;		/* 预览帧率 / 整机 CPU 占用 */
 static lv_obj_t	*rec_dot;		/* 录像中闪的红点 */
@@ -72,6 +76,7 @@ static int	 shot_idx;		/* 第几张照片，用来生成文件名 */
 static int	 video_idx;
 static lv_timer_t *poll_timer;
 static int	 cam_on;		/* 我们这边记录的"摄像头是否已启动" */
+static int	 h265_high_res;	/* 0=640x480，1=1280x960；高分辨率仅供H.265 */
 
 /* /proc/stat 是累计值，CPU 占用率必须用相邻两次采样的差值计算。 */
 static uint64_t	 cpu_last_total;
@@ -196,6 +201,48 @@ static void stats_cb(lv_timer_t *t)
 /* ------------------------------------------------------------------ */
 /* 拍照 / 录像按钮                                                    */
 /* ------------------------------------------------------------------ */
+static void update_resolution_controls(void)
+{
+	if (!btn_res_lb)
+		return;
+	lv_label_set_text(btn_res_lb, h265_high_res ? "1280" : "640");
+	if (h265_high_res) {
+		lv_obj_add_state(btn_photo, LV_STATE_DISABLED);
+		lv_obj_add_state(btn_rec, LV_STATE_DISABLED);
+	} else {
+		lv_obj_remove_state(btn_photo, LV_STATE_DISABLED);
+		lv_obj_remove_state(btn_rec, LV_STATE_DISABLED);
+	}
+}
+
+static void resolution_cb(lv_event_t *e)
+{
+	int next_high;
+	int w, h;
+
+	(void)e;
+	if (cam_recording()) {
+		lv_label_set_text(status_lb, "录像中不能切换分辨率");
+		return;
+	}
+	next_high = !h265_high_res;
+	w = next_high ? 1280 : 640;
+	h = next_high ? 960 : 480;
+	if (cam_on) {
+		cam_stop();
+		cam_on = 0;
+	}
+	if (cam_set_capture_size(w, h) != 0) {
+		lv_label_set_text(status_lb, cam_last_error());
+		return;
+	}
+	h265_high_res = next_high;
+	update_resolution_controls();
+	memset(pv_buf, 0, CAM_PV_W * PV_H * 2);
+	lv_obj_invalidate(canvas);
+	lv_label_set_text_fmt(status_lb, "H265分辨率 %dx%d，正在重启摄像头", w, h);
+}
+
 static void photo_cb(lv_event_t *e)
 {
 	char path[96];
@@ -225,6 +272,7 @@ static int stop_recording(void)
 
 	lv_label_set_text(btn_rec_lb, "AVI");
 	lv_label_set_text(btn_h265_lb, "H265");
+	lv_obj_remove_state(btn_res, LV_STATE_DISABLED);
 	lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 	if (rc == 0)
 		lv_label_set_text(status_lb, "录像已保存到 " CAM_DIR);
@@ -255,6 +303,7 @@ static void rec_cb(lv_event_t *e)
 
 	if (cam_record_start(path, 8) == 0) {
 		lv_label_set_text(btn_rec_lb, "停止");
+		lv_obj_add_state(btn_res, LV_STATE_DISABLED);
 		lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 		lv_label_set_text(status_lb, path);
 	} else {
@@ -281,6 +330,7 @@ static void h265_cb(lv_event_t *e)
 	snprintf(path, sizeof(path), CAM_DIR "/video_%02d_h265.mp4", n);
 	if (cam_record_start_h265(path) == 0) {
 		lv_label_set_text(btn_h265_lb, "停止");
+		lv_obj_add_state(btn_res, LV_STATE_DISABLED);
 		lv_obj_remove_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 		lv_label_set_text(status_lb, path);
 	} else {
@@ -306,6 +356,7 @@ static char last_status[80];
 static void poll_cb(lv_timer_t *t)
 {
 	static int h265_autotest_state;
+	static int avi_autotest_state;
 	uint32_t seq;
 	char buf[80];
 
@@ -322,6 +373,13 @@ static void poll_cb(lv_timer_t *t)
 			cam_stop();
 			cam_on = 0;
 			lv_label_set_text(status_lb, "已暂停");
+		}
+		/* 1280档只属于摄像头页H.265；离开后恢复640，避免YOLO或其他
+		 * 页面下次启动摄像头时误用高分辨率。 */
+		if (h265_high_res) {
+			cam_set_capture_size(640, 480);
+			h265_high_res = 0;
+			update_resolution_controls();
 		}
 		return;
 	}
@@ -383,6 +441,18 @@ static void poll_cb(lv_timer_t *t)
 		} else if (h265_autotest_state == 1 && cam_record_seconds() >= 2) {
 			stop_recording();
 			h265_autotest_state = 2;
+		}
+	}
+
+	/* 与 H.265 自测相同的板端回归入口，用于验证 AVI 文件头、尺寸和
+	 * 录像性能。默认不运行，测试时录制约 2 秒后正常关闭并回填索引。 */
+	if (getenv("CAM_AVI_AUTOTEST")) {
+		if (avi_autotest_state == 0) {
+			rec_cb(NULL);
+			avi_autotest_state = cam_recording() ? 1 : 2;
+		} else if (avi_autotest_state == 1 && cam_record_seconds() >= 2) {
+			stop_recording();
+			avi_autotest_state = 2;
 		}
 	}
 
@@ -484,22 +554,22 @@ static lv_obj_t *build_camera(void)
 			      LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
 	/* 拍照 */
-	lv_obj_t *b1 = lv_button_create(row);
-	lv_obj_set_size(b1, 64, 34);
-	lv_obj_set_style_bg_color(b1, UI_C_ACCENT, 0);
-	btn_photo_lb = lv_label_create(b1);
+	btn_photo = lv_button_create(row);
+	lv_obj_set_size(btn_photo, 64, 34);
+	lv_obj_set_style_bg_color(btn_photo, UI_C_ACCENT, 0);
+	btn_photo_lb = lv_label_create(btn_photo);
 	lv_label_set_text(btn_photo_lb, "拍照");
 	lv_obj_center(btn_photo_lb);
-	lv_obj_add_event_cb(b1, photo_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(btn_photo, photo_cb, LV_EVENT_CLICKED, NULL);
 
 	/* 原始 AVI（兼容旧格式） */
-	lv_obj_t *b2 = lv_button_create(row);
-	lv_obj_set_size(b2, 64, 34);
-	lv_obj_set_style_bg_color(b2, lv_color_hex(0xC03030), 0);
-	btn_rec_lb = lv_label_create(b2);
+	btn_rec = lv_button_create(row);
+	lv_obj_set_size(btn_rec, 64, 34);
+	lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0xC03030), 0);
+	btn_rec_lb = lv_label_create(btn_rec);
 	lv_label_set_text(btn_rec_lb, "AVI");
 	lv_obj_center(btn_rec_lb);
-	lv_obj_add_event_cb(b2, rec_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(btn_rec, rec_cb, LV_EVENT_CLICKED, NULL);
 
 	/* H.265 硬编并封装 MP4 */
 	lv_obj_t *b3 = lv_button_create(row);
@@ -509,6 +579,21 @@ static lv_obj_t *build_camera(void)
 	lv_label_set_text(btn_h265_lb, "H265");
 	lv_obj_center(btn_h265_lb);
 	lv_obj_add_event_cb(b3, h265_cb, LV_EVENT_CLICKED, NULL);
+
+	/* H.265采集分辨率选择。按钮只显示横向像素，完整尺寸在状态栏提示。 */
+	btn_res = lv_button_create(row);
+	lv_obj_set_size(btn_res, 48, 34);
+	lv_obj_set_style_bg_color(btn_res, lv_color_hex(0x306080), 0);
+	btn_res_lb = lv_label_create(btn_res);
+	lv_label_set_text(btn_res_lb, "640");
+	lv_obj_center(btn_res_lb);
+	lv_obj_add_event_cb(btn_res, resolution_cb, LV_EVENT_CLICKED, NULL);
+	if (getenv("CAM_H265_RES") &&
+	    strcmp(getenv("CAM_H265_RES"), "1280x960") == 0) {
+		h265_high_res = 1;
+		cam_set_capture_size(1280, 960);
+	}
+	update_resolution_controls();
 
 	/* 录像中的红点（默认隐藏）*/
 	rec_dot = lv_obj_create(row);

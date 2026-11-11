@@ -52,8 +52,8 @@
 constexpr int kPvW = 320;
 constexpr int kPvH = 160;
 
-constexpr int kCapW = 320;          /* 采集分辨率，见 cam.h 的说明 */
-constexpr int kCapH = 240;
+constexpr int kCapW = 640;          /* 拍照与录像使用完整 640×480 帧 */
+constexpr int kCapH = 480;
 constexpr int kNumBuf = 4;
 constexpr int kRecMaxSec = 10;      /* 录像时长上限，防止把 /tmp 写满 */
 
@@ -187,6 +187,7 @@ public:
 
 	void stop();
 	bool running() const { return run_.load(std::memory_order_acquire); }
+	int set_capture_size(int width, int height);
 
 	/**
 	 * 拷一帧 RGB565 到 dst。
@@ -199,7 +200,7 @@ public:
 	 * 整幅 RGB888 通路（YOLO 用）。
 	 *   enable_rgb(true)  之后每一帧都会顺带转一份 RGB888
 	 *   frame_rgb(dst,bytes) 拷走最新一份，返回帧序号（0 = 还没有）
-	 * 尺寸固定 cap_w() x cap_h()（当前 320x240），紧凑排列 R,G,B。
+	 * 尺寸固定 cap_w() x cap_h()（当前 640x480），紧凑排列 R,G,B。
 	 */
 	void enable_rgb(bool on);
 	uint32_t frame_rgb(uint8_t *dst, int dst_bytes);
@@ -262,11 +263,11 @@ private:
 	 * 整幅 RGB888 快照（给 YOLO 用）。
 	 *
 	 * 【为什么不复用 pv_ 的 RGB565】
-	 *   预览缓冲是 320x160 的【居中裁剪】，上下各丢 40 行；而检测要看整幅
-	 *   320x240，裁掉的部分里有人就直接漏检了。另外 YOLO 要 RGB，不是 RGB565。
+	 *   预览缓冲是 320x160 的【居中裁剪】；而检测要看整幅 640x480，
+	 *   裁掉的部分里有人就直接漏检了。另外 YOLO 要 RGB，不是 RGB565。
 	 *
 	 * 【为什么默认关闭】
-	 *   NV12→RGB888 是 320x240 逐像素算，开着就一直吃 CPU。只有 YOLO
+	 *   NV12→RGB888 是 640x480 逐像素算，开着就一直吃 CPU。只有 YOLO
 	 *   页面在的时候才需要，所以做成开关，进页面开、退页面关。
 	 */
 	std::atomic<bool> rgb_on_{ false };
@@ -289,6 +290,7 @@ private:
 	RecordMode rec_mode_ = RecordMode::Avi;
 	mutable std::mutex rec_mutex_;
 	avi_writer rec_w_{};
+	std::vector<uint8_t> rec_bgr_;      /* AVI 640×480 转换缓冲，启动时一次申请 */
 	H265Recorder h265_;
 	int rec_fps_ = 0;
 	uint64_t rec_started_ms_ = 0;
@@ -297,6 +299,8 @@ private:
 
 	int cap_w_ = kCapW;
 	int cap_h_ = kCapH;
+	int requested_w_ = kCapW;
+	int requested_h_ = kCapH;
 	int capture_fps_ = 0;		/* 驱动确认的实际档位；0 表示由驱动自行决定 */
 
 	mutable std::mutex err_mutex_;

@@ -125,15 +125,38 @@ static uint64_t monotonic_ms()
 	       static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
-/* /tmp 是内存盘，AVI 每帧约 154KB；至少留 4MB 给系统和 AVI 索引。 */
-static bool avi_space_ok(const std::string &path, uint64_t next_bytes)
+/* /tmp 是内存盘：文件占用会直接吃掉 RAM。仅检查文件系统剩余空间不够，
+ * 必须同时看 MemAvailable；否则 AVI 留下几 MB 空间，ffmpeg 一启动仍会 OOM。 */
+static constexpr uint64_t kRecordReserveBytes = 12ULL * 1024 * 1024;
+
+static uint64_t mem_available_bytes()
+{
+	FILE *fp = std::fopen("/proc/meminfo", "r");
+	char line[128];
+	unsigned long long kb;
+
+	if (!fp)
+		return UINT64_MAX;
+	while (std::fgets(line, sizeof(line), fp)) {
+		if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+			std::fclose(fp);
+			return static_cast<uint64_t>(kb) * 1024;
+		}
+	}
+	std::fclose(fp);
+	return UINT64_MAX;
+}
+
+static bool record_resources_ok(const std::string &path, uint64_t next_bytes)
 {
 	struct statvfs fs{};
 	const std::string dir = path.substr(0, path.find_last_of('/'));
+	const uint64_t required = kRecordReserveBytes + next_bytes;
+
 	if (::statvfs(dir.c_str(), &fs) != 0)
 		return false;
-	return static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize >=
-		4ULL * 1024 * 1024 + next_bytes;
+	return static_cast<uint64_t>(fs.f_bavail) * fs.f_frsize >= required &&
+	       mem_available_bytes() >= required;
 }
 
 /* ================================================================== */
@@ -144,6 +167,24 @@ CamCapture::~CamCapture()
 {
 	/* 析构必须 stop，否则线程还在跑时成员先被销毁 → 野指针 */
 	stop();
+}
+
+int CamCapture::set_capture_size(int width, int height)
+{
+	if (run_.load(std::memory_order_acquire) || fd_.valid()) {
+		set_error("切换分辨率前必须先停止摄像头");
+		return -EBUSY;
+	}
+	if (!((width == 640 && height == 480) ||
+	      (width == 1280 && height == 960))) {
+		set_error("不支持的采集分辨率：%dx%d", width, height);
+		return -EINVAL;
+	}
+	requested_w_ = width;
+	requested_h_ = height;
+	cap_w_ = width;
+	cap_h_ = height;
+	return 0;
 }
 
 int CamCapture::start(const std::string &video_dev,
@@ -284,7 +325,7 @@ void CamCapture::enable_rgb(bool on)
 
 uint32_t CamCapture::frame_rgb(uint8_t *dst, int dst_bytes)
 {
-	constexpr int need = kCapW * kCapH * 3;
+	const int need = cap_w_ * cap_h_ * 3;
 
 	if (!dst || dst_bytes < need)
 		return 0;
@@ -328,8 +369,8 @@ bool CamCapture::open_device(const std::string &dev)
 	 * 走这条路径不需要额外转换，也能吃到 ISP 的降噪/锐化。
 	 */
 	fmt.type = kCapType;
-	fmt.fmt.pix_mp.width = kCapW;
-	fmt.fmt.pix_mp.height = kCapH;
+	fmt.fmt.pix_mp.width = static_cast<uint32_t>(requested_w_);
+	fmt.fmt.pix_mp.height = static_cast<uint32_t>(requested_h_);
 	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
 	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
 
@@ -810,14 +851,12 @@ bool CamCapture::handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd,
 					const uint64_t period = 1000 /
 						static_cast<uint64_t>(rec_fps_);
 					if (now >= rec_next_frame_ms_) {
-						if (!avi_space_ok("/tmp/cam", rec_w_.frame_bytes + 32)) {
+						if (!record_resources_ok("/tmp/cam", rec_w_.frame_bytes + 32)) {
 							no_space = true;
 						} else {
-						std::vector<uint8_t> bgr(
-							static_cast<size_t>(kPvW) * kPvH * 3);
 						nv12_to_bgr24(y, uv, cap_w_, cap_h_,
-							      bgr.data(), kPvW, kPvH);
-						avi_add_frame(&rec_w_, bgr.data());
+								      rec_bgr_.data(), cap_w_, cap_h_);
+						avi_add_frame(&rec_w_, rec_bgr_.data());
 						rec_next_frame_ms_ += period ? period : 1;
 						if (rec_next_frame_ms_ <= now)
 							rec_next_frame_ms_ = now +
@@ -828,7 +867,7 @@ bool CamCapture::handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd,
 			}
 		}
 		if (no_space) {
-			set_error("录像已停止：临时空间不足，先备份或清理旧视频");
+			set_error("录像已停止：可用内存或临时空间不足，请清理旧视频");
 			record_stop();
 			return held_by_venc;
 		}
@@ -910,12 +949,19 @@ int CamCapture::record_start(const std::string &path, int fps)
 		fps = 8;
 	if (capture_fps_ > 0 && fps > capture_fps_)
 		fps = capture_fps_;
-	if (!avi_space_ok(path, static_cast<uint64_t>(kPvW) * kPvH * 3 + 32)) {
-		set_error("临时空间不足，先备份或清理旧视频");
+	if (!record_resources_ok(path,
+				 static_cast<uint64_t>(cap_w_) * cap_h_ * 3 + 32)) {
+		set_error("可用内存或临时空间不足，请先备份或清理旧视频");
+		return -1;
+	}
+	try {
+		rec_bgr_.resize(static_cast<size_t>(cap_w_) * cap_h_ * 3);
+	} catch (...) {
+		set_error("AVI 640x480 转换缓冲分配失败（内存不足）");
 		return -1;
 	}
 
-	if (avi_open(&rec_w_, path.c_str(), kPvW, kPvH, fps) != 0) {
+	if (avi_open(&rec_w_, path.c_str(), cap_w_, cap_h_, fps) != 0) {
 		set_error("创建录像文件失败：%s", path.c_str());
 		return -1;
 	}
@@ -927,7 +973,7 @@ int CamCapture::record_start(const std::string &path, int fps)
 	rec_sec_.store(0);
 	rec_on_.store(true, std::memory_order_release);
 	log("开始录像：%s  %dx%d@%dfps（上限 %d 秒）",
-	    path.c_str(), kPvW, kPvH, fps, kRecMaxSec);
+	    path.c_str(), cap_w_, cap_h_, fps, kRecMaxSec);
 	return 0;
 }
 
@@ -937,6 +983,12 @@ int CamCapture::record_start_h265(const std::string &path)
 
 	if (!run_.load(std::memory_order_acquire) || rec_on_.load())
 		return -1;
+	/* H.265 停止时 raw 码流和 MP4 会短暂同时存在，ffmpeg 也需要工作
+	 * 内存。预留约 6MB 临时输出，并始终给系统留下 12MB 安全余量。 */
+	if (!record_resources_ok(path, 6ULL * 1024 * 1024)) {
+		set_error("可用内存或临时空间不足，请先备份或清理旧视频");
+		return -1;
+	}
 	/* 没拿到驱动报告时，SC3336 的正式模式就是 30fps。这里不是给
 	 * 摄像头限帧，只是写进码流/MP4 的时间基。 */
 	rec_fps_ = capture_fps_ > 0 ? capture_fps_ : 30;
@@ -1027,6 +1079,11 @@ int cam_start(const char *video_dev, const char *iq_dir)
 void cam_stop(void) { camp::instance().stop(); }
 
 bool cam_running(void) { return camp::instance().running(); }
+
+int cam_set_capture_size(int w, int h)
+{
+	return camp::instance().set_capture_size(w, h);
+}
 
 uint32_t cam_preview(uint16_t *dst, int dst_bytes)
 {

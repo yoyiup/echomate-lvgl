@@ -455,14 +455,14 @@ extern "C" int avi_close(avi_writer *w)
 
 	/* ---- 回填总帧数 ----
 	 * avih.dwTotalFrames  在偏移 48
-	 * strh.dwLength       在偏移 48 + (8+56) + (8+8) + 4 = 132
+	 * strh.dwLength       在偏移 140
 	 *   avih 数据 32..88，然后 LIST strl(12) + strh头(8) → 108 起是 strh 数据
 	 *   dwFlags(4) wPriority(2) wLanguage(2) dwInitialFrames(4) dwScale(4) dwRate(4)
-	 *   → dwStart 在 128，dwLength 在 132
+	 *   → dwRate 在 132，dwStart 在 136，dwLength 在 140
 	 */
 	fseek(w->fp, 48, SEEK_SET);
 	w32(w->fp, w->frames);
-	fseek(w->fp, 132, SEEK_SET);
+	fseek(w->fp, 140, SEEK_SET);
 	w32(w->fp, w->frames);
 
 	/* ---- 回填 RIFF 总大小 = 文件长度 - 8 ---- */
