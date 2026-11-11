@@ -114,6 +114,7 @@ add_executable(lvgl_app
     src/cam/cam_capture.cpp
     src/cam/cam_image.cpp
     src/cam/h265_recorder.cpp
+    src/cam/jpeg_encoder.cpp
     src/ui/ui_camera.c
     src/ui/ui_gallery.c
     # ===== 电机（D1：/dev/echo_motor，两路 GPIO H 桥）=====
@@ -147,7 +148,7 @@ set_source_files_properties(src/yolo/yolo_detect.cpp PROPERTIES
 
 # Rockit/VENC 头文件只给硬件编码封装使用，避免改一个 include 路径就让
 # 整个应用的 C/C++ 文件全部重编。
-set_source_files_properties(src/cam/h265_recorder.cpp PROPERTIES
+set_source_files_properties(src/cam/h265_recorder.cpp src/cam/jpeg_encoder.cpp PROPERTIES
     INCLUDE_DIRECTORIES
     "/home/tao/Echo-Mate/SDK/rv1106-sdk/media/out/include")
 

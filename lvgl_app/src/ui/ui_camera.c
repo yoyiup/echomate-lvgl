@@ -256,7 +256,7 @@ static void photo_cb(lv_event_t *e)
 	}
 
 	n = next_index(&shot_idx, KEEP_SHOTS);
-	snprintf(path, sizeof(path), CAM_DIR "/shot_%02d.bmp", n);
+	snprintf(path, sizeof(path), CAM_DIR "/shot_%02d.jpg", n);
 
 	if (cam_photo(path) == 0) {
 		lv_label_set_text(btn_photo_lb, "已拍");
@@ -357,6 +357,7 @@ static void poll_cb(lv_timer_t *t)
 {
 	static int h265_autotest_state;
 	static int avi_autotest_state;
+	static int photo_autotest_done;
 	uint32_t seq;
 	char buf[80];
 
@@ -454,6 +455,13 @@ static void poll_cb(lv_timer_t *t)
 			stop_recording();
 			avi_autotest_state = 2;
 		}
+	}
+
+	/* 单帧 JPEG 板端回归入口：相机出帧后自动拍一张，供部署脚本检查
+	 * JPEG 标记、640x480 尺寸和完整解码。默认不运行。 */
+	if (getenv("CAM_PHOTO_AUTOTEST") && !photo_autotest_done) {
+		photo_cb(NULL);
+		photo_autotest_done = 1;
 	}
 
 	seq = cam_preview(pv_buf, CAM_PV_W * PV_H * 2);

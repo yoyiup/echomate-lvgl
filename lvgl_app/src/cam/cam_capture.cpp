@@ -820,10 +820,8 @@ bool CamCapture::handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd,
 			path = photo_path_;
 		}
 
-		std::vector<uint8_t> bgr(static_cast<size_t>(cap_w_) * cap_h_ * 3);
-
-		nv12_to_bgr24(y, uv, cap_w_, cap_h_, bgr.data(), cap_w_, cap_h_);
-		if (bmp_write(path.c_str(), bgr.data(), cap_w_, cap_h_) == 0) {
+		if (jpeg_.encode_dmabuf(path, dmabuf_fd, y, bytes,
+					cap_w_, cap_h_, 90) == 0) {
 			{
 				std::lock_guard<std::mutex> lk(photo_mutex_);
 				photo_last_ = path;
@@ -831,7 +829,8 @@ bool CamCapture::handle_frame(uint8_t *y, uint8_t *uv, int dmabuf_fd,
 			photo_cnt_.fetch_add(1);
 			log("拍照已保存：%s", path.c_str());
 		} else {
-			set_error("写 BMP 失败：%s", path.c_str());
+			set_error("JPEG 拍照失败：%s（%s）", path.c_str(),
+				  jpeg_.last_error().c_str());
 		}
 		photo_req_.store(false, std::memory_order_release);
 	}
@@ -922,6 +921,10 @@ int CamCapture::photo(const std::string &path)
 {
 	if (!run_.load(std::memory_order_acquire) || path.empty())
 		return -1;
+	if (cap_w_ != 640 || cap_h_ != 480) {
+		set_error("拍照仅支持 640x480，请先切换回标准分辨率");
+		return -1;
+	}
 	if (photo_req_.load(std::memory_order_acquire))
 		return -1;                      /* 上一张还没写完 */
 

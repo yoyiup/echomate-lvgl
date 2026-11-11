@@ -76,7 +76,9 @@ static void rebuild_gallery(void)
 
 		if (entry->d_name[0] == '.')
 			continue;
-		if (has_suffix(entry->d_name, ".bmp")) type = "照片";
+		if (has_suffix(entry->d_name, ".jpg") ||
+		    has_suffix(entry->d_name, ".jpeg") ||
+		    has_suffix(entry->d_name, ".bmp")) type = "照片";
 		else if (has_suffix(entry->d_name, ".avi")) type = "AVI";
 		else if (has_suffix(entry->d_name, ".mp4")) type = "MP4";
 		else continue;

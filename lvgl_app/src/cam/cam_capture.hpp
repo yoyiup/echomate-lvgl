@@ -41,6 +41,7 @@
 
 #include "cam_image.h"      /* nv12_to_rgb565 / nv12_to_bgr24 / avi_writer（纯 C） */
 #include "h265_recorder.hpp"
+#include "jpeg_encoder.hpp"
 
 /*
  * 预览尺寸 ← 统一在这里定义，cam.h 的宏必须和它一致。
@@ -283,6 +284,7 @@ private:
 	std::string photo_path_;
 	std::string photo_last_;
 	std::atomic<uint32_t> photo_cnt_{ 0 };
+	JpegEncoder jpeg_;
 
 	/* 录像 */
 	std::atomic<bool> rec_on_{ false };
